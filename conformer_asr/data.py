@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -18,8 +20,31 @@ _TRAIN_SUBSETS: dict[str, list[str]] = {
 }
 
 
-def _load_split(dataset_id: str, split: str):
-    return load_dataset(dataset_id, split=split, trust_remote_code=True)
+def setup_cache_dir(cache_dir: str | None) -> str | None:
+    """Direct HF downloads (datasets + transformers hub) into ``cache_dir``.
+
+    Call this once, as early as possible in every entrypoint — subprocesses
+    spawned later (e.g. HF ``datasets`` workers) inherit these env vars, so
+    arrow shards, audio files, and any model artifacts all land on scratch
+    instead of $HOME.
+    """
+    if not cache_dir:
+        return None
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HOME", cache_dir)
+    os.environ.setdefault("HF_DATASETS_CACHE", str(Path(cache_dir) / "datasets"))
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(Path(cache_dir) / "hub"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(Path(cache_dir) / "transformers"))
+    return cache_dir
+
+
+def _load_split(dataset_id: str, split: str, cache_dir: str | None):
+    return load_dataset(
+        dataset_id,
+        split=split,
+        trust_remote_code=True,
+        cache_dir=cache_dir,
+    )
 
 
 def load_librispeech(cfg: DataConfig) -> DatasetDict:
@@ -28,10 +53,11 @@ def load_librispeech(cfg: DataConfig) -> DatasetDict:
         raise ValueError(
             f"Unknown subset '{cfg.subset}'. Choose from {list(_TRAIN_SUBSETS)}."
         )
-    train_parts = [_load_split(cfg.dataset_id, s) for s in _TRAIN_SUBSETS[cfg.subset]]
+    setup_cache_dir(cfg.cache_dir)
+    train_parts = [_load_split(cfg.dataset_id, s, cfg.cache_dir) for s in _TRAIN_SUBSETS[cfg.subset]]
     train = train_parts[0] if len(train_parts) == 1 else concatenate_datasets(train_parts)
-    validation = _load_split(cfg.dataset_id, cfg.eval_split)
-    test = _load_split(cfg.dataset_id, cfg.test_split)
+    validation = _load_split(cfg.dataset_id, cfg.eval_split, cfg.cache_dir)
+    test = _load_split(cfg.dataset_id, cfg.test_split, cfg.cache_dir)
 
     ds = DatasetDict({"train": train, "validation": validation, "test": test})
     ds = ds.cast_column("audio", Audio(sampling_rate=cfg.sampling_rate))

@@ -27,7 +27,7 @@ class ModelConfig:
 @dataclass
 class DataConfig:
     dataset_id: str = "openslr/librispeech_asr"
-    subset: str = "clean100"  # "clean100" | "clean460" | "all960"
+    subset: str = "all960"  # "clean100" | "clean460" | "all960"
     eval_split: str = "validation.clean"
     test_split: str = "test.clean"
     sampling_rate: int = 16000
@@ -35,6 +35,9 @@ class DataConfig:
     max_audio_seconds: float = 20.0
     num_proc: int = 4
     tokenizer_dir: str = "tokenizer"
+    # Everything downloaded / cached (audio, arrow shards, transformers hub, models)
+    # lands under this directory. Point this at scratch so $HOME doesn't fill up.
+    cache_dir: str = "/fs/scratch/PAS2836/lees_stuff/hf_cache"
 
 
 @dataclass

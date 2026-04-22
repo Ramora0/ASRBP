@@ -15,7 +15,7 @@ model:
 
 data:
   dataset_id: openslr/librispeech_asr
-  subset: clean100
+  subset: all960             # default: full 960h; override with --subset clean100 for smoke tests
   eval_split: validation.clean
   test_split: test.clean
   sampling_rate: 16000
@@ -23,6 +23,7 @@ data:
   max_audio_seconds: 20.0
   num_proc: 4
   tokenizer_dir: tokenizer
+  cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache   # HF datasets + transformers cache
 
 train:
   output_dir: outputs/run

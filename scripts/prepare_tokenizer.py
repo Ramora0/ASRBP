@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from datasets import concatenate_datasets, load_dataset  # noqa: E402
 
 from conformer_asr.config import load_config  # noqa: E402
+from conformer_asr.data import setup_cache_dir  # noqa: E402
 from conformer_asr.tokenizer import iter_transcripts, train_tokenizer  # noqa: E402
 
 
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--subset", choices=list(_TRAIN_SUBSETS), default=None)
     p.add_argument("--vocab_size", type=int, default=1000)
     p.add_argument("--output_dir", default=None, help="overrides data.tokenizer_dir")
+    p.add_argument("--cache_dir", default=None, help="overrides data.cache_dir")
     return p.parse_args()
 
 
@@ -35,11 +37,13 @@ def main() -> None:
     cfg = load_config(args.config)
     subset = args.subset or cfg.data.subset
     out_dir = args.output_dir or cfg.data.tokenizer_dir
+    cache_dir = args.cache_dir or cfg.data.cache_dir
+    setup_cache_dir(cache_dir)
 
     splits = _TRAIN_SUBSETS[subset]
-    print(f"Loading transcripts from {splits} …")
+    print(f"Loading transcripts from {splits} (cache_dir={cache_dir}) …")
     parts = [
-        load_dataset(cfg.data.dataset_id, split=s, trust_remote_code=True)
+        load_dataset(cfg.data.dataset_id, split=s, trust_remote_code=True, cache_dir=cache_dir)
         for s in splits
     ]
     ds = parts[0] if len(parts) == 1 else concatenate_datasets(parts)

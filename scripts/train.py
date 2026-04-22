@@ -18,6 +18,7 @@ from conformer_asr.data import (  # noqa: E402
     DataCollatorSpeechSeq2SeqWithPadding,
     load_librispeech,
     preprocess_dataset,
+    setup_cache_dir,
 )
 from conformer_asr.metrics import build_compute_metrics  # noqa: E402
 from conformer_asr.model import build_model  # noqa: E402
@@ -44,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--learning_rate", type=float)
     p.add_argument("--warmup_steps", type=int)
     p.add_argument("--tokenizer_dir")
+    p.add_argument("--cache_dir", help="overrides data.cache_dir")
     p.add_argument("--report_to", help="e.g. 'wandb', 'tensorboard', or 'wandb,tensorboard'")
     # wandb overrides
     p.add_argument("--wandb_project", dest="project")
@@ -76,6 +78,11 @@ def main() -> None:
         # Strip 'wandb' from report_to so HF's WandbCallback doesn't fire either.
         parts = [p.strip() for p in cfg.train.report_to.split(",") if p.strip() and p.strip() != "wandb"]
         cfg.train.report_to = ",".join(parts) if parts else "none"
+
+    # Point HF caches at scratch BEFORE importing/loading anything else that
+    # might lazily trigger a download.
+    setup_cache_dir(cfg.data.cache_dir)
+    print(f"HF cache_dir: {cfg.data.cache_dir}")
 
     print(f"Loading tokenizer from {cfg.data.tokenizer_dir}")
     tokenizer = load_tokenizer(cfg.data.tokenizer_dir)

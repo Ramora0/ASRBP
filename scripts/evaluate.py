@@ -15,6 +15,7 @@ from tqdm import tqdm  # noqa: E402
 from transformers import SpeechEncoderDecoderModel, Wav2Vec2FeatureExtractor  # noqa: E402
 
 from conformer_asr.config import load_config  # noqa: E402
+from conformer_asr.data import setup_cache_dir  # noqa: E402
 from conformer_asr.tokenizer import load_tokenizer, normalize_text  # noqa: E402
 from conformer_asr.wandb_utils import init_wandb  # noqa: E402
 
@@ -29,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--output_json", default="results/wer.json")
+    p.add_argument("--cache_dir", default=None, help="overrides data.cache_dir")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--wandb_run_name", dest="run_name", default=None)
     p.add_argument("--wandb_tags", dest="tags", default=None, help="comma-separated")
@@ -38,6 +40,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    if args.cache_dir:
+        cfg.data.cache_dir = args.cache_dir
+    setup_cache_dir(cfg.data.cache_dir)
+
     if args.run_name:
         cfg.wandb.run_name = args.run_name
     if args.tags:
@@ -62,8 +68,13 @@ def main() -> None:
         return_attention_mask=True,
     )
 
-    print(f"Loading split {args.split}")
-    ds = load_dataset(cfg.data.dataset_id, split=args.split, trust_remote_code=True)
+    print(f"Loading split {args.split} (cache_dir={cfg.data.cache_dir})")
+    ds = load_dataset(
+        cfg.data.dataset_id,
+        split=args.split,
+        trust_remote_code=True,
+        cache_dir=cfg.data.cache_dir,
+    )
     ds = ds.cast_column("audio", Audio(sampling_rate=cfg.data.sampling_rate))
     if args.max_samples is not None:
         ds = ds.select(range(min(args.max_samples, len(ds))))

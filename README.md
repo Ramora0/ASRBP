@@ -16,6 +16,24 @@ Trains an attention encoder-decoder ASR model from scratch:
 uv pip install -e .
 ```
 
+## 0. (Recommended) Pre-download LibriSpeech to scratch
+
+LibriSpeech is ~60 GB once extracted. The default cache location is
+`/fs/scratch/PAS2836/lees_stuff/hf_cache` (set in `configs/conformer_small.yaml`
+under `data.cache_dir`). Every script also sets `HF_HOME`, `HF_DATASETS_CACHE`,
+`HUGGINGFACE_HUB_CACHE`, and `TRANSFORMERS_CACHE` to the same place so sub-processes
+(HF workers, transformers hub downloads) don't scatter files into `$HOME`.
+
+Run this once on a login node with internet, before scheduling a GPU job:
+
+```bash
+python scripts/download_librispeech.py
+# override the cache path if needed:
+python scripts/download_librispeech.py --cache_dir /path/to/scratch/hf_cache
+```
+
+This fetches all seven splits (train-clean-100/360, train-other-500, validation-clean/other, test-clean/other). Subsequent `train.py` / `evaluate.py` runs hit the cache — useful on GPU nodes without outbound network.
+
 ## 1. Build the tokenizer
 
 ```bash
@@ -27,6 +45,12 @@ Use `--subset clean100` to train the BPE on just `train-clean-100` (faster; same
 
 ## 2. Train
 
+Full 960 h run (the default — no `--subset` flag needed):
+
+```bash
+python scripts/train.py --output_dir outputs/full
+```
+
 Smoke test on the 100 h subset:
 
 ```bash
@@ -36,15 +60,6 @@ python scripts/train.py \
   --eval_steps 100 \
   --per_device_train_batch_size 4 \
   --output_dir outputs/smoke
-```
-
-Full 960 h run:
-
-```bash
-python scripts/train.py \
-  --subset all960 \
-  --max_steps 150000 \
-  --output_dir outputs/full
 ```
 
 Defaults come from `configs/conformer_small.yaml`. Any CLI flag overrides the YAML.

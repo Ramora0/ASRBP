@@ -43,13 +43,19 @@ class _CompatBartForCausalLM(BartForCausalLM):
         cache_position=None,
         **kwargs,
     ):
-        if input_ids is not None and inputs_embeds is not None:
-            inputs_embeds = None
+        # Always pre-embed ourselves and pass inputs_embeds only. This avoids
+        # any codepath inside BartDecoder that might derive inputs_embeds from
+        # input_ids before the "both specified" check.
+        if input_ids is not None:
+            bart_decoder = self.model.decoder
+            embed_scale = getattr(bart_decoder, "embed_scale", 1.0)
+            inputs_embeds = bart_decoder.embed_tokens(input_ids) * embed_scale
+            input_ids = None
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.model.decoder(
-            input_ids=input_ids,
+            input_ids=None,
             attention_mask=attention_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,

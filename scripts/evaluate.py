@@ -8,13 +8,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# --- HF cache bootstrap: MUST run before any HF / conformer_asr import. ---
+from bootstrap_cache import bootstrap_cache_from_argv  # noqa: E402
+
+_resolved_cache = bootstrap_cache_from_argv()
+print(f"HF cache_dir (bootstrapped): {_resolved_cache}")
+# -------------------------------------------------------------------------
+
 import evaluate as hf_evaluate  # noqa: E402
 import torch  # noqa: E402
 from datasets import Audio, load_dataset  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 from transformers import SpeechEncoderDecoderModel, Wav2Vec2FeatureExtractor  # noqa: E402
 
-from conformer_asr.config import load_config  # noqa: E402
+from conformer_asr.config import autocast_dtype as _autocast_dtype, load_config, resolve_precision  # noqa: E402
 from conformer_asr.data import setup_cache_dir  # noqa: E402
 from conformer_asr.tokenizer import load_tokenizer, normalize_text  # noqa: E402
 from conformer_asr.wandb_utils import init_wandb  # noqa: E402
@@ -43,6 +50,7 @@ def main() -> None:
     if args.cache_dir:
         cfg.data.cache_dir = args.cache_dir
     setup_cache_dir(cfg.data.cache_dir)
+    resolve_precision(cfg.train)
 
     if args.run_name:
         cfg.wandb.run_name = args.run_name
@@ -100,8 +108,8 @@ def main() -> None:
     preds_all: list[str] = []
     refs_all: list[str] = []
 
-    autocast_dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    use_autocast = device == "cuda"
+    autocast_dtype = _autocast_dtype(cfg.train) if device == "cuda" else torch.float32
+    use_autocast = device == "cuda" and autocast_dtype != torch.float32
 
     for start in tqdm(range(0, len(ds), args.batch_size), desc=f"generate({args.split})"):
         batch = ds[start : start + args.batch_size]

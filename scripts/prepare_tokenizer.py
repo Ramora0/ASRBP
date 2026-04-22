@@ -8,6 +8,13 @@ from pathlib import Path
 # Allow running as `python scripts/prepare_tokenizer.py` without install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# --- HF cache bootstrap: MUST run before any HF / conformer_asr import. ---
+from bootstrap_cache import bootstrap_cache_from_argv  # noqa: E402
+
+_resolved_cache = bootstrap_cache_from_argv()
+print(f"HF cache_dir (bootstrapped): {_resolved_cache}")
+# -------------------------------------------------------------------------
+
 from datasets import concatenate_datasets, load_dataset  # noqa: E402
 
 from conformer_asr.config import load_config  # noqa: E402

@@ -34,6 +34,15 @@ python scripts/download_librispeech.py --cache_dir /path/to/scratch/hf_cache
 
 This fetches all seven splits (train-clean-100/360, train-other-500, validation-clean/other, test-clean/other). Subsequent `train.py` / `evaluate.py` runs hit the cache — useful on GPU nodes without outbound network.
 
+> **How the cache redirect actually works.** `datasets` and `transformers` read
+> `HF_HOME` / `HF_DATASETS_CACHE` / `TRANSFORMERS_CACHE` *at import time* and
+> freeze the resolved paths. So every entrypoint imports `bootstrap_cache`
+> (a tiny module at the project root that has no HF deps) and calls
+> `bootstrap_cache_from_argv()` **before** any `datasets` / `transformers` /
+> `conformer_asr.*` import. It reads `--cache_dir` / `--config` from `sys.argv`
+> and sets the env vars up front. To force a different location outside the
+> YAML / CLI, export `HF_HOME_OVERRIDE=/some/path` — it wins over everything.
+
 ## 1. Build the tokenizer
 
 ```bash

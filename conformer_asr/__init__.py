@@ -1,4 +1,4 @@
-from .config import Config, WandbConfig, load_config
+from .config import Config, WandbConfig, autocast_dtype, load_config, resolve_precision
 from .data import (
     DataCollatorSpeechSeq2SeqWithPadding,
     load_librispeech,
@@ -17,7 +17,9 @@ from .wandb_utils import (
 __all__ = [
     "Config",
     "WandbConfig",
+    "autocast_dtype",
     "load_config",
+    "resolve_precision",
     "DataCollatorSpeechSeq2SeqWithPadding",
     "load_librispeech",
     "preprocess_dataset",

@@ -7,13 +7,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# --- HF cache bootstrap: MUST run before any ``datasets`` / ``transformers`` / ---
+# --- ``conformer_asr.*`` import, otherwise HF snapshots the wrong cache paths. ---
+from bootstrap_cache import bootstrap_cache_from_argv  # noqa: E402
+
+_resolved_cache = bootstrap_cache_from_argv()
+print(f"HF cache_dir (bootstrapped): {_resolved_cache}")
+# -------------------------------------------------------------------------------
+
 from transformers import (  # noqa: E402
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     Wav2Vec2FeatureExtractor,
 )
 
-from conformer_asr.config import load_config  # noqa: E402
+from conformer_asr.config import load_config, resolve_precision  # noqa: E402
 from conformer_asr.data import (  # noqa: E402
     DataCollatorSpeechSeq2SeqWithPadding,
     load_librispeech,
@@ -79,10 +87,13 @@ def main() -> None:
         parts = [p.strip() for p in cfg.train.report_to.split(",") if p.strip() and p.strip() != "wandb"]
         cfg.train.report_to = ",".join(parts) if parts else "none"
 
-    # Point HF caches at scratch BEFORE importing/loading anything else that
-    # might lazily trigger a download.
+    # Cache was already redirected at import time by bootstrap_cache_from_argv().
+    # Keep setup_cache_dir() as a belt-and-braces no-op for env vars that might
+    # have been set differently by the CLI (e.g. --cache_dir via argparse).
     setup_cache_dir(cfg.data.cache_dir)
-    print(f"HF cache_dir: {cfg.data.cache_dir}")
+
+    # V100 / Volta doesn't support bf16 — fall back to fp16 automatically.
+    resolve_precision(cfg.train)
 
     print(f"Loading tokenizer from {cfg.data.tokenizer_dir}")
     tokenizer = load_tokenizer(cfg.data.tokenizer_dir)

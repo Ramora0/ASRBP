@@ -119,3 +119,31 @@ def load_config(path: str | Path | None = None, overrides: dict[str, Any] | None
                     setattr(section, key, val)
                     break
     return cfg
+
+
+def resolve_precision(train_cfg: TrainConfig) -> None:
+    """Flip bf16→fp16 on GPUs that don't support bfloat16 (e.g. V100 / Volta).
+
+    Mutates ``train_cfg`` in place. Intended to run after CLI overrides but
+    before TrainingArguments / autocast dtype is built.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    if train_cfg.bf16 and not torch.cuda.is_bf16_supported():
+        device_name = torch.cuda.get_device_name(0)
+        print(f"[precision] bf16 not supported on {device_name}; using fp16.")
+        train_cfg.bf16 = False
+        train_cfg.fp16 = True
+
+
+def autocast_dtype(train_cfg: TrainConfig) -> "torch.dtype":
+    """Pick the autocast dtype implied by ``train_cfg`` (for manual autocast sites)."""
+    import torch
+
+    if train_cfg.bf16:
+        return torch.bfloat16
+    if train_cfg.fp16:
+        return torch.float16
+    return torch.float32

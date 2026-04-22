@@ -29,3 +29,24 @@ def build_compute_metrics(tokenizer: PreTrainedTokenizerFast) -> Callable:
         return {"wer": float(wer)}
 
     return compute_metrics
+
+
+def build_predictions_table(
+    tokenizer: PreTrainedTokenizerFast,
+    preds: list[list[int]],
+    refs: list[list[int]],
+    max_rows: int = 64,
+):
+    """Build a wandb.Table of ref/prediction pairs. Returns None if wandb is missing."""
+    try:
+        import wandb
+    except ImportError:
+        return None
+
+    table = wandb.Table(columns=["reference", "prediction"])
+    for p_ids, r_ids in list(zip(preds, refs))[:max_rows]:
+        table.add_data(
+            tokenizer.decode(r_ids, skip_special_tokens=True),
+            tokenizer.decode(p_ids, skip_special_tokens=True),
+        )
+    return table

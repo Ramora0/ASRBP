@@ -61,6 +61,32 @@ python scripts/evaluate.py \
 
 `--split test.other` also works if you want to report the noisy split.
 
+## Weights & Biases
+
+wandb is on by default (`report_to: wandb` in the YAML). Before running anything, log in once:
+
+```bash
+wandb login
+```
+
+Then train/eval automatically log:
+
+- **train**: loss, learning_rate, grad_norm, **epoch** (as a first-class metric on the x-axis), WER on `validation.clean` at every eval step, a small table of sample predictions per eval
+- **eval**: final WER on `test.clean` / `test.other` as a summary metric, plus a table of reference/prediction pairs
+- the full resolved config (model/data/train sections) as the run config
+- model parameter count, dataset sizes, and tokenizer vocab size as summary fields
+- the final model directory as a wandb Artifact
+
+Common overrides:
+
+```bash
+python scripts/train.py --wandb_run_name conformer-small-960h --wandb_tags baseline,bf16
+python scripts/train.py --no_wandb                        # disable entirely
+python scripts/evaluate.py --checkpoint ... --wandb_tags final-eval
+```
+
+Set `wandb.watch_model: true` in the YAML to additionally log gradients and weights (bandwidth-heavy; off by default).
+
 ## Memory and hyperparameters
 
 The default config (`configs/conformer_small.yaml`) targets ~50 M parameters and batches of 8 × 20 s clips in bf16, comfortably under 32 GB. To reduce memory further:

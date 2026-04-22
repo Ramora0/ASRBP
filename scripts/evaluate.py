@@ -16,6 +16,7 @@ from transformers import SpeechEncoderDecoderModel, Wav2Vec2FeatureExtractor  # 
 
 from conformer_asr.config import load_config  # noqa: E402
 from conformer_asr.tokenizer import load_tokenizer, normalize_text  # noqa: E402
+from conformer_asr.wandb_utils import init_wandb  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,12 +29,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--output_json", default="results/wer.json")
+    p.add_argument("--no_wandb", action="store_true")
+    p.add_argument("--wandb_run_name", dest="run_name", default=None)
+    p.add_argument("--wandb_tags", dest="tags", default=None, help="comma-separated")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    if args.run_name:
+        cfg.wandb.run_name = args.run_name
+    if args.tags:
+        cfg.wandb.tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    # Evaluation runs get tagged so they're easy to filter in the wandb UI.
+    cfg.wandb.tags = list(cfg.wandb.tags) + [f"eval:{args.split}"]
+    if args.no_wandb:
+        cfg.wandb.enabled = False
+
     tokenizer_dir = args.tokenizer_dir or cfg.data.tokenizer_dir
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,6 +67,23 @@ def main() -> None:
     ds = ds.cast_column("audio", Audio(sampling_rate=cfg.data.sampling_rate))
     if args.max_samples is not None:
         ds = ds.select(range(min(args.max_samples, len(ds))))
+
+    # Force wandb on for evaluate.py even if the training config disabled it,
+    # as long as the user didn't pass --no_wandb. Init BEFORE inference so any
+    # generation errors are still captured by the run.
+    force_report = "wandb" if (cfg.wandb.enabled and not args.no_wandb) else "none"
+    cfg.train.report_to = force_report
+    wandb_run = init_wandb(
+        cfg,
+        extra_config={
+            "checkpoint": args.checkpoint,
+            "split": args.split,
+            "num_beams": args.num_beams,
+            "batch_size": args.batch_size,
+            "max_samples": args.max_samples or len(ds),
+        },
+        job_type="eval",
+    )
 
     wer = hf_evaluate.load("wer")
     preds_all: list[str] = []
@@ -109,6 +139,23 @@ def main() -> None:
         json.dump(existing, fh, indent=2)
 
     print(json.dumps(result, indent=2))
+
+    if wandb_run is not None:
+        import wandb
+
+        key = f"final_wer/{args.split}"
+        wandb_run.summary[key] = float(score)
+        wandb_run.summary["num_beams"] = args.num_beams
+        wandb_run.summary["num_samples"] = len(preds_all)
+        wandb.log({key: float(score)})
+
+        if cfg.wandb.log_preds_table:
+            n = min(cfg.wandb.log_preds_n, len(preds_all))
+            table = wandb.Table(columns=["reference", "prediction"])
+            for ref, pred in zip(refs_all[:n], preds_all[:n]):
+                table.add_data(ref, pred)
+            wandb.log({f"eval/{args.split}/predictions": table})
+        wandb.finish()
 
 
 if __name__ == "__main__":

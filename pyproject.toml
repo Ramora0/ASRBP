@@ -10,7 +10,11 @@ requires-python = ">=3.10"
 dependencies = [
     "torch>=2.3",
     "transformers>=4.45",
-    "datasets>=2.20",
+    # datasets <3.0 keeps audio decoding on soundfile. datasets >=3.0 switched to
+    # torchcodec, which forces tight torch/torchcodec version coupling
+    # (torchcodec 0.11 needs torch 2.9, 0.7 needs torch 2.6, etc.). Stay below 3.0
+    # unless you know your torch version matches an available torchcodec release.
+    "datasets>=2.20,<3.0",
     "accelerate>=0.33",
     "evaluate>=0.4",
     "jiwer>=3.0",

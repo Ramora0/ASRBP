@@ -1,17 +1,22 @@
 model:
+  # Encoder matches Conformer-M (Gulati et al. 2020, Table 1): 16 layers, 256 dim,
+  # 4 heads, FFN expansion 4× → ~30M encoder params. Paper's conv kernel is 32;
+  # HF defaults to 31 — functionally equivalent.
   encoder_hidden_size: 256
-  encoder_num_hidden_layers: 12
+  encoder_num_hidden_layers: 16
   encoder_num_attention_heads: 4
   encoder_intermediate_size: 1024
   encoder_conv_depthwise_kernel_size: 31
   encoder_mask_time_prob: 0.05
   encoder_mask_feature_prob: 0.05
-  decoder_d_model: 512
-  decoder_layers: 6
-  decoder_attention_heads: 8
-  decoder_ffn_dim: 2048
+  # AED decoder (not in the paper; they used RNN-T). Kept small and proportional
+  # to the encoder so total model lands around ~35M params.
+  decoder_d_model: 256
+  decoder_layers: 4
+  decoder_attention_heads: 4
+  decoder_ffn_dim: 1024
   decoder_dropout: 0.1
-  decoder_max_position_embeddings: 512
+  decoder_max_position_embeddings: 448
 
 data:
   dataset_id: openslr/librispeech_asr
@@ -19,7 +24,6 @@ data:
   eval_split: validation.clean
   test_split: test.clean
   sampling_rate: 16000
-  min_audio_seconds: 1.0
   max_audio_seconds: 20.0
   num_proc: 4
   tokenizer_dir: tokenizer
@@ -31,21 +35,22 @@ train:
   per_device_eval_batch_size: 8
   gradient_accumulation_steps: 4
   learning_rate: 5.0e-4
-  warmup_steps: 10000
-  max_steps: 150000
-  weight_decay: 1.0e-6
+  warmup_ratio: 0.06
+  num_train_epochs: 20.0
+  weight_decay: 1.0e-2
   adam_beta1: 0.9
   adam_beta2: 0.98
-  adam_epsilon: 1.0e-9
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
   label_smoothing_factor: 0.1
-  eval_steps: 5000
-  save_steps: 5000
+  lr_scheduler_type: cosine
   logging_steps: 100
   save_total_limit: 3
   bf16: true
   fp16: false
   gradient_checkpointing: false
   group_by_length: true
+  dataloader_num_workers: 8
   report_to: wandb
   seed: 42
   generation_max_length: 300

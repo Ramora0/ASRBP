@@ -78,12 +78,10 @@ def preprocess_dataset(
     """Filter by duration, extract audio features, tokenize labels."""
 
     sr = cfg.sampling_rate
-    min_len = int(cfg.min_audio_seconds * sr)
     max_len = int(cfg.max_audio_seconds * sr)
 
     def is_valid_length(example):
-        n = len(example["audio"]["array"])
-        return min_len <= n <= max_len
+        return len(example["audio"]["array"]) <= max_len
 
     # Only filter training clips by max length — we still want to score all eval audio.
     ds["train"] = ds["train"].filter(is_valid_length, num_proc=cfg.num_proc)

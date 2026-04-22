@@ -44,14 +44,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="configs/conformer_small.yaml")
     p.add_argument("--subset", choices=["clean100", "clean460", "all960"])
     p.add_argument("--output_dir")
-    p.add_argument("--max_steps", type=int)
-    p.add_argument("--eval_steps", type=int)
-    p.add_argument("--save_steps", type=int)
+    p.add_argument("--num_train_epochs", type=float)
     p.add_argument("--per_device_train_batch_size", type=int)
     p.add_argument("--per_device_eval_batch_size", type=int)
     p.add_argument("--gradient_accumulation_steps", type=int)
     p.add_argument("--learning_rate", type=float)
-    p.add_argument("--warmup_steps", type=int)
+    p.add_argument("--warmup_ratio", type=float)
     p.add_argument("--tokenizer_dir")
     p.add_argument("--cache_dir", help="overrides data.cache_dir")
     p.add_argument("--report_to", help="e.g. 'wandb', 'tensorboard', or 'wandb,tensorboard'")
@@ -147,25 +145,22 @@ def main() -> None:
         per_device_eval_batch_size=cfg.train.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
         learning_rate=cfg.train.learning_rate,
-        warmup_steps=cfg.train.warmup_steps,
-        max_steps=cfg.train.max_steps,
+        warmup_ratio=cfg.train.warmup_ratio,
+        num_train_epochs=cfg.train.num_train_epochs,
         weight_decay=cfg.train.weight_decay,
         adam_beta1=cfg.train.adam_beta1,
         adam_beta2=cfg.train.adam_beta2,
         adam_epsilon=cfg.train.adam_epsilon,
+        max_grad_norm=cfg.train.max_grad_norm,
         label_smoothing_factor=cfg.train.label_smoothing_factor,
-        lr_scheduler_type="inverse_sqrt",
-        eval_strategy="steps",
-        eval_steps=cfg.train.eval_steps,
-        save_strategy="steps",
-        save_steps=cfg.train.save_steps,
+        lr_scheduler_type=cfg.train.lr_scheduler_type,
+        eval_strategy="epoch",
+        save_strategy="epoch",
         logging_steps=cfg.train.logging_steps,
         save_total_limit=cfg.train.save_total_limit,
         bf16=cfg.train.bf16,
         fp16=cfg.train.fp16,
         gradient_checkpointing=cfg.train.gradient_checkpointing,
-        group_by_length=cfg.train.group_by_length,
-        length_column_name="input_length",
         report_to=cfg.train.report_to,
         run_name=cfg.wandb.run_name,  # used by wandb via HF integration
         seed=cfg.train.seed,
@@ -175,7 +170,7 @@ def main() -> None:
         load_best_model_at_end=True,
         metric_for_best_model="wer",
         greater_is_better=False,
-        dataloader_num_workers=2,
+        dataloader_num_workers=cfg.train.dataloader_num_workers,
         remove_unused_columns=False,
     )
 
@@ -223,7 +218,7 @@ def main() -> None:
             metadata={
                 "n_parameters": n_params,
                 "subset": cfg.data.subset,
-                "max_steps": cfg.train.max_steps,
+                "num_train_epochs": cfg.train.num_train_epochs,
             },
         )
         artifact.add_dir(str(final_dir))

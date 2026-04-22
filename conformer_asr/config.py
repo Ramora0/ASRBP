@@ -10,18 +10,18 @@ import yaml
 @dataclass
 class ModelConfig:
     encoder_hidden_size: int = 256
-    encoder_num_hidden_layers: int = 12
+    encoder_num_hidden_layers: int = 16  # Conformer-M (Gulati et al. 2020)
     encoder_num_attention_heads: int = 4
     encoder_intermediate_size: int = 1024
     encoder_conv_depthwise_kernel_size: int = 31
     encoder_mask_time_prob: float = 0.05
     encoder_mask_feature_prob: float = 0.05
-    decoder_d_model: int = 512
-    decoder_layers: int = 6
-    decoder_attention_heads: int = 8
-    decoder_ffn_dim: int = 2048
+    decoder_d_model: int = 256
+    decoder_layers: int = 4
+    decoder_attention_heads: int = 4
+    decoder_ffn_dim: int = 1024
     decoder_dropout: float = 0.1
-    decoder_max_position_embeddings: int = 512
+    decoder_max_position_embeddings: int = 448
 
 
 @dataclass
@@ -31,7 +31,6 @@ class DataConfig:
     eval_split: str = "validation.clean"
     test_split: str = "test.clean"
     sampling_rate: int = 16000
-    min_audio_seconds: float = 1.0
     max_audio_seconds: float = 20.0
     num_proc: int = 4
     tokenizer_dir: str = "tokenizer"
@@ -47,21 +46,22 @@ class TrainConfig:
     per_device_eval_batch_size: int = 8
     gradient_accumulation_steps: int = 4
     learning_rate: float = 5e-4
-    warmup_steps: int = 10000
-    max_steps: int = 150000
-    weight_decay: float = 1e-6
+    warmup_ratio: float = 0.06
+    num_train_epochs: float = 20.0
+    weight_decay: float = 1e-2
     adam_beta1: float = 0.9
     adam_beta2: float = 0.98
-    adam_epsilon: float = 1e-9
+    adam_epsilon: float = 1e-8
+    max_grad_norm: float = 1.0
     label_smoothing_factor: float = 0.1
-    eval_steps: int = 5000
-    save_steps: int = 5000
+    lr_scheduler_type: str = "cosine"
     logging_steps: int = 100
     save_total_limit: int = 3
     bf16: bool = True
     fp16: bool = False
     gradient_checkpointing: bool = False
     group_by_length: bool = True
+    dataloader_num_workers: int = 8
     report_to: str = "wandb"  # comma-separated: "wandb", "tensorboard", or "wandb,tensorboard"
     seed: int = 42
     generation_max_length: int = 300

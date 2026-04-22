@@ -67,10 +67,3 @@ wandb:
   watch_model: false      # true to log gradients/weights (heavy)
   log_preds_table: true   # log sample predictions table during eval
   log_preds_n: 32
-
-python - <<'EOF'                                                                                                                                
-import transformers.models.bart.modeling_bart as m, inspect
-src = inspect.getsource(m.BartDecoder.forward)                                                                                                  
-for i, line in enumerate(src.splitlines(), start=m.BartDecoder.forward.__code__.co_firstlineno):
-  print(f"{i}: {line}")                                                                                                                       
-EOF

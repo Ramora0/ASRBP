@@ -15,7 +15,7 @@ _resolved_cache = bootstrap_cache_from_argv()
 print(f"HF cache_dir (bootstrapped): {_resolved_cache}")
 # -------------------------------------------------------------------------
 
-import evaluate as hf_evaluate  # noqa: E402
+from conformer_asr.metrics import compute_wer  # noqa: E402
 import torch  # noqa: E402
 from datasets import Audio, load_dataset  # noqa: E402
 from tqdm import tqdm  # noqa: E402
@@ -104,7 +104,6 @@ def main() -> None:
         job_type="eval",
     )
 
-    wer = hf_evaluate.load("wer")
     preds_all: list[str] = []
     refs_all: list[str] = []
 
@@ -136,7 +135,7 @@ def main() -> None:
         preds_all.extend(preds)
         refs_all.extend(refs)
 
-    score = wer.compute(predictions=preds_all, references=refs_all)
+    score = compute_wer(preds_all, refs_all)
     result = {
         "checkpoint": args.checkpoint,
         "split": args.split,

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-from datasets import Audio, DatasetDict, concatenate_datasets, load_dataset
+from datasets import Audio, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from transformers import PreTrainedTokenizerFast, Wav2Vec2FeatureExtractor
 
 from .config import DataConfig
@@ -69,13 +71,65 @@ def _duration_seconds(example: dict[str, Any], sampling_rate: int) -> float:
     return len(audio["array"]) / sampling_rate
 
 
+def _preprocess_cache_key(
+    feature_extractor: Wav2Vec2FeatureExtractor,
+    tokenizer: PreTrainedTokenizerFast,
+    cfg: DataConfig,
+) -> str:
+    """Stable hash of everything that affects preprocessing output.
+
+    Covers subset/eval/test splits (dataset content), audio params (filter +
+    feature extraction), FE config, and tokenizer state. Bump whenever
+    preprocessing logic itself changes.
+    """
+    try:
+        tok_repr = tokenizer.backend_tokenizer.to_str()
+    except Exception:
+        tok_repr = json.dumps(sorted(tokenizer.get_vocab().items()))
+    blob = json.dumps(
+        {
+            "v": 1,  # preprocessing-logic version; bump when prepare() changes
+            "dataset_id": cfg.dataset_id,
+            "subset": cfg.subset,
+            "eval_split": cfg.eval_split,
+            "test_split": cfg.test_split,
+            "sampling_rate": cfg.sampling_rate,
+            "max_audio_seconds": cfg.max_audio_seconds,
+            "fe": feature_extractor.to_dict(),
+            "tok_sha": hashlib.sha1(tok_repr.encode("utf-8")).hexdigest(),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _preprocess_cache_dir(cfg: DataConfig, key: str) -> Path | None:
+    if not cfg.cache_dir:
+        return None
+    return Path(cfg.cache_dir) / "preprocessed" / f"{cfg.subset}-{key}"
+
+
 def preprocess_dataset(
     ds: DatasetDict,
     feature_extractor: Wav2Vec2FeatureExtractor,
     tokenizer: PreTrainedTokenizerFast,
     cfg: DataConfig,
 ) -> DatasetDict:
-    """Filter by duration, extract audio features, tokenize labels."""
+    """Filter by duration, extract audio features, tokenize labels.
+
+    The finished DatasetDict is saved to ``<cache_dir>/preprocessed/<key>``
+    and reloaded on subsequent runs — HF's auto-fingerprint cache is unreliable
+    here because the ``feature_extractor`` / ``tokenizer`` closures don't hash
+    deterministically across processes.
+    """
+
+    key = _preprocess_cache_key(feature_extractor, tokenizer, cfg)
+    save_dir = _preprocess_cache_dir(cfg, key)
+
+    if save_dir is not None and save_dir.exists():
+        print(f"[preprocess] loading cached dataset from {save_dir}")
+        return load_from_disk(str(save_dir))
 
     sr = cfg.sampling_rate
     max_len = int(cfg.max_audio_seconds * sr)
@@ -110,6 +164,15 @@ def preprocess_dataset(
             num_proc=cfg.num_proc,
             desc=f"preprocess {split}",
         )
+
+    if save_dir is not None:
+        save_dir.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dir = save_dir.with_name(save_dir.name + ".tmp")
+        print(f"[preprocess] saving preprocessed dataset to {save_dir}")
+        ds.save_to_disk(str(tmp_dir))
+        os.replace(tmp_dir, save_dir)
+        ds = load_from_disk(str(save_dir))
+
     return ds
 
 

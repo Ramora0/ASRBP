@@ -12,6 +12,25 @@ from transformers import (
 from .config import ModelConfig
 
 
+class _CompatBartForCausalLM(BartForCausalLM):
+    """Drop ``inputs_embeds`` when ``input_ids`` is also provided.
+
+    SpeechEncoderDecoderModel in transformers >=4.51 passes both kwargs down
+    to the decoder; BartDecoder raises on the combination. ``input_ids`` is
+    authoritative — ``inputs_embeds`` would just be its embedding — so we
+    prefer it.
+    """
+
+    def forward(self, input_ids=None, inputs_embeds=None, **kwargs):
+        if input_ids is not None and inputs_embeds is not None:
+            inputs_embeds = None
+        return super().forward(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+
+
 def _build_encoder_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
     return Wav2Vec2ConformerConfig(
         hidden_size=mcfg.encoder_hidden_size,
@@ -71,7 +90,7 @@ def build_model(mcfg: ModelConfig, tokenizer: PreTrainedTokenizerFast) -> Speech
     dec_cfg = _build_decoder_config(mcfg, len(tokenizer), pad_id, bos_id, eos_id)
 
     encoder = Wav2Vec2ConformerModel(enc_cfg)
-    decoder = BartForCausalLM(dec_cfg)
+    decoder = _CompatBartForCausalLM(dec_cfg)
     model = SpeechEncoderDecoderModel(encoder=encoder, decoder=decoder)
 
     # Wire special tokens at the top-level config so generate() picks them up.

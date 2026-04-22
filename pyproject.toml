@@ -9,7 +9,11 @@ description = "Conformer attention encoder-decoder ASR trained from scratch on L
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.3",
-    "transformers>=4.45",
+    # transformers 5.x broke SpeechEncoderDecoderModel + BartForCausalLM composite
+    # (BartDecoder internally conflates input_ids / inputs_embeds, and warmup_ratio
+    # is slated for removal). Stay on the 4.x line until we migrate off the
+    # composite encoder-decoder API.
+    "transformers>=4.45,<5",
     # datasets <3.0 keeps audio decoding on soundfile. datasets >=3.0 switched to
     # torchcodec, which forces tight torch/torchcodec version coupling
     # (torchcodec 0.11 needs torch 2.9, 0.7 needs torch 2.6, etc.). Stay below 3.0

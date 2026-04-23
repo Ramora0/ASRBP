@@ -44,6 +44,10 @@ data:
   test_split: test.clean
   sampling_rate: 16000
   max_audio_seconds: 20.0
+  # Kaldi-style 3-way speed perturbation. [1.0] = off (no augmentation);
+  # [0.9, 1.0, 1.1] triples the train split with ±10% resampling. Only the
+  # train split is perturbed; eval/test stay at the original rate.
+  speed_perturbations: [0.9, 1.0, 1.1]
   num_proc: 0         # 0 = autodetect (sched_getaffinity on Linux, os.cpu_count() elsewhere); thread pools are pinned to 1 in scripts/preprocess.py so they don't oversubscribe
   # null → fetch SB's pretrained SentencePiece from HF Hub into cache_dir.
   # Point at a local directory (e.g. a previous run's outputs/run/final) to

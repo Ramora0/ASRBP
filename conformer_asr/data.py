@@ -4,12 +4,14 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from datasets import Audio, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
+from scipy.signal import resample_poly
 from transformers import PreTrainedTokenizerFast
 
 from .config import DataConfig, ModelConfig
@@ -88,6 +90,33 @@ def _duration_seconds(example: dict[str, Any], sampling_rate: int) -> float:
     return len(audio["array"]) / sampling_rate
 
 
+def _speed_ratio(speed: float) -> tuple[int, int]:
+    """Return an ``(up, down)`` rational approximation of ``1 / speed``.
+
+    ``scipy.signal.resample_poly`` takes integer up/down factors. For Kaldi-
+    style speeds (0.9 / 1.1) the exact ratios are 10/9 and 10/11 — we cap the
+    denominator at 100 for any other speed so we stay cheap for the common
+    case but don't hard-code just the two canonical factors.
+    """
+    frac = Fraction(1.0 / float(speed)).limit_denominator(100)
+    return frac.numerator, frac.denominator
+
+
+def _speed_perturb(wav: np.ndarray, speed: float) -> np.ndarray:
+    """Kaldi-style speed perturbation via polyphase resampling.
+
+    A ``speed`` factor of 0.9 stretches the waveform to ~1.111× length (slower,
+    lower-pitched); 1.1 compresses it to ~0.909× length (faster, higher-pitched).
+    Pitch shifts with duration — this is the Ko et al. 2015 recipe, not a
+    phase-vocoder time-stretch. ``speed == 1.0`` is a no-op and returns the
+    input unchanged.
+    """
+    if abs(speed - 1.0) < 1e-9:
+        return wav
+    up, down = _speed_ratio(speed)
+    return resample_poly(wav, up=up, down=down).astype(np.float32, copy=False)
+
+
 def _preprocess_cache_key(
     mcfg: ModelConfig,
     tokenizer: PreTrainedTokenizerFast,
@@ -106,13 +135,16 @@ def _preprocess_cache_key(
 
     blob = json.dumps(
         {
-            "v": 2,  # bumped when switching from raw-waveform FE to log-Mel
+            "v": 3,  # bumped when adding speed perturbation to the train split
             "dataset_id": cfg.dataset_id,
             "subset": cfg.subset,
             "eval_split": cfg.eval_split,
             "test_split": cfg.test_split,
             "sampling_rate": cfg.sampling_rate,
             "max_audio_seconds": cfg.max_audio_seconds,
+            # Sorted + rounded so [1.0, 0.9, 1.1] and [0.9, 1.0, 1.1] collide
+            # on the same cache and tiny float noise can't fork the key.
+            "speeds": sorted(round(float(s), 4) for s in cfg.speed_perturbations),
             "mel": {
                 "n_mels": mcfg.n_mels,
                 "n_fft": mcfg.n_fft,
@@ -165,46 +197,60 @@ def preprocess_dataset(
     hop_length = mcfg.hop_length
     num_proc = resolve_num_proc(cfg.num_proc)
 
+    # Dedup + sort so cache key and map both see the same list even if the user
+    # wrote the YAML as [1.1, 0.9, 1.0]. Eval/test always run at 1.0x regardless.
+    train_speeds = sorted({round(float(s), 4) for s in cfg.speed_perturbations}) or [1.0]
+    eval_speeds = [1.0]
+
     def is_valid_length(example):
         return len(example["audio"]["array"]) <= max_len
 
     # Only filter training clips by max length — we still want to score all eval audio.
     ds["train"] = ds["train"].filter(is_valid_length, num_proc=num_proc)
 
-    def prepare_batched(batch):
-        audios = batch["audio"]
-        texts = batch["text"]
-        mels: list[np.ndarray] = []
-        lengths: list[int] = []
-        labels: list[list[int]] = []
-        for audio, text in zip(audios, texts):
-            wav = np.asarray(audio["array"], dtype=np.float32)
-            mel = log_mel_spectrogram(
-                wav,
-                n_mels=n_mels,
-                n_fft=n_fft,
-                hop_length=hop_length,
-                sampling_rate=sr,
-            )  # (T_mel, n_mels) torch.float32
-            # .numpy() is a zero-copy view; we skip .tolist() because materializing
-            # a nested Python list of ~160K floats per 20 s clip dominates walltime
-            # at 960 h scale. Arrow serializes the numpy array directly.
-            mels.append(mel.numpy())
-            lengths.append(int(mel.shape[0]))
-            labels.append(tokenizer(normalize_text(text)).input_ids)
-        return {
-            "input_features": mels,
-            "input_length": lengths,
-            "labels": labels,
-        }
+    def make_prepare(speeds: list[float]):
+        def prepare_batched(batch):
+            audios = batch["audio"]
+            texts = batch["text"]
+            mels: list[np.ndarray] = []
+            lengths: list[int] = []
+            labels: list[list[int]] = []
+            for audio, text in zip(audios, texts):
+                wav = np.asarray(audio["array"], dtype=np.float32)
+                token_ids = tokenizer(normalize_text(text))["input_ids"]
+                for speed in speeds:
+                    wav_s = _speed_perturb(wav, speed) if speed != 1.0 else wav
+                    mel = log_mel_spectrogram(
+                        wav_s,
+                        n_mels=n_mels,
+                        n_fft=n_fft,
+                        hop_length=hop_length,
+                        sampling_rate=sr,
+                    )  # (T_mel, n_mels) torch.float32
+                    # .numpy() is a zero-copy view; we skip .tolist() because materializing
+                    # a nested Python list of ~160K floats per 20 s clip dominates walltime
+                    # at 960 h scale. Arrow serializes the numpy array directly.
+                    mels.append(mel.numpy())
+                    lengths.append(int(mel.shape[0]))
+                    # Transcript is unchanged across speeds — append the same token
+                    # ids for each perturbed copy.
+                    labels.append(token_ids)
+            return {
+                "input_features": mels,
+                "input_length": lengths,
+                "labels": labels,
+            }
+
+        return prepare_batched
 
     remove_cols = {
         split: [c for c in ds[split].column_names if c not in {"input_length"}]
         for split in ds
     }
     for split in ds:
+        speeds = train_speeds if split == "train" else eval_speeds
         ds[split] = ds[split].map(
-            prepare_batched,
+            make_prepare(speeds),
             batched=True,
             batch_size=256,
             remove_columns=remove_cols[split],

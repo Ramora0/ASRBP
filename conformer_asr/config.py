@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,13 @@ class DataConfig:
     sampling_rate: int
     max_audio_seconds: float
     num_proc: int
+    # Kaldi-style 3-way speed perturbation (Ko et al. 2015). Each training clip
+    # is replicated at every listed speed via rational-factor resampling — 0.9
+    # stretches the waveform by 10/9 (slower, lower-pitched), 1.1 by 10/11
+    # (faster, higher-pitched). Applied only to the train split at preprocess
+    # time and folded into the cache key, so the on-disk cache already contains
+    # all perturbed copies. Default [1.0] is a no-op (no perturbation).
+    speed_perturbations: list[float] = field(default_factory=lambda: [1.0])
     # Tokenizer: null means "download SB's pretrained SentencePiece from HF Hub
     # into ``cache_dir`` (repo: speechbrain/asr-transformer-transformerlm-librispeech)."
     # A local path is only consulted if it contains ``sentencepiece.model``

@@ -63,6 +63,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_proc", type=int, help="Override data.num_proc")
     p.add_argument("--cache_dir", help="Override data.cache_dir")
     p.add_argument("--tokenizer_dir")
+    p.add_argument(
+        "--speed_perturbations",
+        type=float,
+        nargs="+",
+        help="Kaldi-style train-time speed factors, e.g. --speed_perturbations 0.9 1.0 1.1. "
+        "Pass a single 1.0 to disable.",
+    )
     return p.parse_args()
 
 

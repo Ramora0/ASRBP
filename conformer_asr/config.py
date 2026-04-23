@@ -42,7 +42,7 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     output_dir: str = "outputs/run"
-    per_device_train_batch_size: int = 16
+    per_device_train_batch_size: int = 32
     per_device_eval_batch_size: int = 8
     gradient_accumulation_steps: int = 4
     learning_rate: float = 5e-4

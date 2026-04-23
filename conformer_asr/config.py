@@ -19,6 +19,11 @@ class ModelConfig:
     encoder_hidden_dropout: float
     encoder_attention_dropout: float
     encoder_activation_dropout: float
+    # Stochastic depth: uniform probability of skipping a whole encoder layer
+    # during training. HF implements this as ``Wav2Vec2ConformerConfig.layerdrop``
+    # (drop-the-layer form, not the paper's linear-per-depth schedule, but close
+    # enough in practice). ~0.1 is standard for Conformer.
+    encoder_layerdrop: float
     # Log-Mel frontend (see conformer_asr/features.py). Mel features are
     # computed offline at preprocess time; the encoder's Conv2d subsampling
     # stem consumes them directly — no waveform feature encoder.
@@ -50,8 +55,13 @@ class DataConfig:
     sampling_rate: int
     max_audio_seconds: float
     num_proc: int
-    tokenizer_dir: str
-    cache_dir: str
+    # Tokenizer: null means "download SB's pretrained SentencePiece from HF Hub
+    # into ``cache_dir`` (repo: speechbrain/asr-transformer-transformerlm-librispeech)."
+    # A local path is only consulted if it contains ``sentencepiece.model``
+    # (e.g. a prior training run's ``final/`` dir) and otherwise falls through
+    # to the Hub download.
+    tokenizer_dir: str | None = None
+    cache_dir: str = ""
 
 
 @dataclass
@@ -81,6 +91,16 @@ class TrainConfig:
     seed: int
     generation_max_length: int
     generation_num_beams: int
+    # Stochastic Weight Averaging. When enabled, maintains a running mean of
+    # weights from ``swa_start_frac * num_train_epochs`` onward (per-epoch sampling),
+    # and at end of training writes the averaged weights to
+    # ``<output_dir>/final-swa/pytorch_model.bin``. Evaluate separately via
+    # ``scripts/evaluate.py --checkpoint <output_dir>/final-swa``. Adds one
+    # extra full-model copy on GPU (~200 MB for Conformer-S — rounding error on
+    # 32 GB V100). Conformer uses LayerNorm, so no post-hoc BN update pass is
+    # needed.
+    swa_enabled: bool
+    swa_start_frac: float
 
 
 @dataclass

@@ -24,6 +24,21 @@ _TRAIN_SUBSETS: dict[str, list[str]] = {
 }
 
 
+def resolve_num_proc(n: int) -> int:
+    """Resolve ``num_proc`` to an actual worker count.
+
+    ``n <= 0`` means autodetect: prefer ``os.sched_getaffinity`` so we honor
+    SLURM / cgroup pins (the host may have 128 cores but the job is allocated
+    16), and fall back to ``os.cpu_count()`` on platforms without it (macOS).
+    """
+    if n and n > 0:
+        return n
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
 def setup_cache_dir(cache_dir: str | None) -> str | None:
     """Direct HF downloads (datasets + transformers hub) into ``cache_dir``.
 
@@ -148,12 +163,13 @@ def preprocess_dataset(
     n_mels = mcfg.n_mels
     n_fft = mcfg.n_fft
     hop_length = mcfg.hop_length
+    num_proc = resolve_num_proc(cfg.num_proc)
 
     def is_valid_length(example):
         return len(example["audio"]["array"]) <= max_len
 
     # Only filter training clips by max length — we still want to score all eval audio.
-    ds["train"] = ds["train"].filter(is_valid_length, num_proc=cfg.num_proc)
+    ds["train"] = ds["train"].filter(is_valid_length, num_proc=num_proc)
 
     def prepare_batched(batch):
         audios = batch["audio"]
@@ -192,7 +208,7 @@ def preprocess_dataset(
             batched=True,
             batch_size=256,
             remove_columns=remove_cols[split],
-            num_proc=cfg.num_proc,
+            num_proc=num_proc,
             desc=f"preprocess {split}",
         )
 

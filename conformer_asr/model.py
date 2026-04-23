@@ -514,7 +514,7 @@ def _build_encoder_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
         attention_dropout=mcfg.encoder_attention_dropout,
         activation_dropout=mcfg.encoder_activation_dropout,
         feat_proj_dropout=0.0,
-        layerdrop=0.0,
+        layerdrop=mcfg.encoder_layerdrop,
         apply_spec_augment=True,
     )
     # Stashed on the config so save_pretrained / from_pretrained preserve it —

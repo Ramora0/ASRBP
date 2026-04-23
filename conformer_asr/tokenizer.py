@@ -1,81 +1,175 @@
+"""Tokenizer: SpeechBrain's pretrained SentencePiece (5K unigram) over LibriSpeech.
+
+We consume SB's published ``tokenizer.ckpt`` from HF Hub rather than training
+our own BPE, which (a) removes a pipeline step and hosted artifact, and (b)
+keeps vocab-aligned with ``speechbrain/asr-transformer-transformerlm-librispeech``
+so we can warm-start the decoder and do shallow fusion on future retrains.
+
+The vocab was trained on uppercase LibriSpeech transcripts; ``normalize_text``
+no longer lowercases.
+"""
 from __future__ import annotations
 
-import os
+import json
 import re
+import shutil
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Sequence
 
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors, trainers
-from transformers import PreTrainedTokenizerFast
+import torch
 
-
-PAD_TOKEN = "<pad>"
-BOS_TOKEN = "<s>"
-EOS_TOKEN = "</s>"
-UNK_TOKEN = "<unk>"
-SPECIAL_TOKENS = [PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, UNK_TOKEN]
+SB_TOKENIZER_REPO = "speechbrain/asr-transformer-transformerlm-librispeech"
+SB_TOKENIZER_FILE = "tokenizer.ckpt"
+SB_PAD_ID = 0
+SB_BOS_ID = 1
+SB_EOS_ID = 2
+SB_UNK_ID = 3
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
 def normalize_text(text: str) -> str:
-    return _WHITESPACE_RE.sub(" ", text.strip().lower())
+    """Whitespace-normalize a transcript. Preserves case — LibriSpeech is
+    natively uppercase and so is SB's SentencePiece vocab."""
+    return _WHITESPACE_RE.sub(" ", text.strip())
 
 
-def train_tokenizer(
-    corpus: Iterable[str],
-    out_dir: str | Path,
-    vocab_size: int = 1000,
-) -> PreTrainedTokenizerFast:
-    """Train a byte-level BPE on LibriSpeech transcripts and save to ``out_dir``.
+class SpeechBrainTokenizer:
+    """Adapter around SB's pretrained SentencePiece over the subset of the
+    ``PreTrainedTokenizerFast`` API this codebase consumes.
 
-    Saves files compatible with ``PreTrainedTokenizerFast.from_pretrained``.
+    Intentionally not a subclass of HF ``PreTrainedTokenizerFast`` — avoiding
+    that inheritance spares us from having to satisfy its (considerable)
+    internal contract around ``added_tokens_encoder``, ``slow_tokenizer_class``,
+    ``save_vocabulary``, etc. Duck-typed API surface is enough here.
     """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = Tokenizer(models.BPE(unk_token=UNK_TOKEN))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
-    tokenizer.decoder = decoders.ByteLevel()
+    pad_token: str = "<pad>"
+    bos_token: str = "<s>"
+    eos_token: str = "</s>"
+    unk_token: str = "<unk>"
+    pad_token_id: int = SB_PAD_ID
+    bos_token_id: int = SB_BOS_ID
+    eos_token_id: int = SB_EOS_ID
+    unk_token_id: int = SB_UNK_ID
 
-    trainer = trainers.BpeTrainer(
-        vocab_size=vocab_size,
-        special_tokens=SPECIAL_TOKENS,
-        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-        show_progress=True,
-    )
-    tokenizer.train_from_iterator((normalize_text(t) for t in corpus), trainer=trainer)
+    def __init__(self, sp_model_path: str | Path):
+        import sentencepiece as spm
 
-    bos_id = tokenizer.token_to_id(BOS_TOKEN)
-    eos_id = tokenizer.token_to_id(EOS_TOKEN)
-    tokenizer.post_processor = processors.TemplateProcessing(
-        single=f"{BOS_TOKEN} $A {EOS_TOKEN}",
-        special_tokens=[(BOS_TOKEN, bos_id), (EOS_TOKEN, eos_id)],
-    )
+        self._sp_model_path = Path(sp_model_path)
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.load(str(self._sp_model_path))
 
-    fast = PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer,
-        pad_token=PAD_TOKEN,
-        bos_token=BOS_TOKEN,
-        eos_token=EOS_TOKEN,
-        unk_token=UNK_TOKEN,
-    )
-    fast.save_pretrained(str(out_dir))
-    return fast
+    def __len__(self) -> int:
+        return self.sp.get_piece_size()
+
+    def __call__(self, text: str) -> dict[str, list[int]]:
+        # BOS/EOS framing mirrors the old TemplateProcessing post-processor so
+        # the collator's leading-BOS strip (see DataCollatorSpeechSeq2SeqWithPadding)
+        # keeps working unchanged.
+        ids = [self.bos_token_id] + self.sp.encode(text, out_type=int) + [self.eos_token_id]
+        return {"input_ids": ids}
+
+    def _strip_special(self, ids: Sequence[int]) -> list[int]:
+        specials = {self.pad_token_id, self.bos_token_id, self.eos_token_id, self.unk_token_id}
+        out: list[int] = []
+        for i in ids:
+            i = int(i)
+            if i < 0:
+                continue
+            if i in specials:
+                continue
+            out.append(i)
+        return out
+
+    def decode(self, ids: Any, skip_special_tokens: bool = True) -> str:
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        else:
+            ids = list(ids)
+        if skip_special_tokens:
+            ids = self._strip_special(ids)
+        return self.sp.decode(ids)
+
+    def batch_decode(self, batch: Any, skip_special_tokens: bool = True) -> list[str]:
+        if hasattr(batch, "tolist"):
+            batch = batch.tolist()
+        return [self.decode(row, skip_special_tokens=skip_special_tokens) for row in batch]
+
+    def pad(self, features: list[dict[str, Any]], padding: bool | str = True, return_tensors: str | None = None):
+        from transformers import BatchEncoding
+
+        ids_list = [list(f["input_ids"]) for f in features]
+        max_len = max(len(x) for x in ids_list)
+        bsz = len(ids_list)
+        if return_tensors == "pt":
+            input_ids = torch.full((bsz, max_len), self.pad_token_id, dtype=torch.long)
+            attn = torch.zeros((bsz, max_len), dtype=torch.long)
+            for i, x in enumerate(ids_list):
+                input_ids[i, : len(x)] = torch.tensor(x, dtype=torch.long)
+                attn[i, : len(x)] = 1
+        else:
+            input_ids = [x + [self.pad_token_id] * (max_len - len(x)) for x in ids_list]
+            attn = [[1] * len(x) + [0] * (max_len - len(x)) for x in ids_list]
+        return BatchEncoding({"input_ids": input_ids, "attention_mask": attn})
+
+    def get_vocab(self) -> dict[str, int]:
+        return {self.sp.id_to_piece(i): i for i in range(len(self))}
+
+    def save_pretrained(self, path: str | Path) -> None:
+        """Copy the SP model + a pointer manifest into ``path`` so a checkpoint
+        directory is self-contained."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        shutil.copy(str(self._sp_model_path), str(path / "sentencepiece.model"))
+        with open(path / "tokenizer_info.json", "w") as f:
+            json.dump(
+                {
+                    "source": "speechbrain",
+                    "repo": SB_TOKENIZER_REPO,
+                    "file": SB_TOKENIZER_FILE,
+                    "vocab_size": len(self),
+                    "pad_id": self.pad_token_id,
+                    "bos_id": self.bos_token_id,
+                    "eos_id": self.eos_token_id,
+                    "unk_id": self.unk_token_id,
+                },
+                f,
+                indent=2,
+            )
 
 
-def load_tokenizer(path: str | Path) -> PreTrainedTokenizerFast:
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Tokenizer not found at {path}. Run scripts/prepare_tokenizer.py first."
+def _download_sb_tokenizer(cache_dir: str | None, repo: str = SB_TOKENIZER_REPO) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    return Path(
+        hf_hub_download(
+            repo_id=repo,
+            filename=SB_TOKENIZER_FILE,
+            cache_dir=cache_dir,
         )
-    return PreTrainedTokenizerFast.from_pretrained(str(path))
+    )
 
 
-def iter_transcripts(dataset) -> Iterable[str]:
-    """Yield raw transcripts from a HF dataset that has a 'text' column."""
-    for example in dataset:
-        text = example.get("text")
-        if text:
-            yield text
+def load_tokenizer(
+    path: str | Path | None = None,
+    *,
+    cache_dir: str | None = None,
+    repo: str = SB_TOKENIZER_REPO,
+) -> SpeechBrainTokenizer:
+    """Load SB's pretrained SentencePiece tokenizer.
+
+    - If ``path`` is given and contains ``sentencepiece.model`` (written by a
+      prior training run's ``save_pretrained``), load from there.
+    - Otherwise, download ``tokenizer.ckpt`` from ``repo`` (cached under
+      ``cache_dir`` if provided, else HF's default).
+    """
+    if path is not None:
+        local_sp = Path(path) / "sentencepiece.model"
+        if local_sp.exists():
+            return SpeechBrainTokenizer(local_sp)
+        print(
+            f"[tokenizer] no sentencepiece.model in {path}; falling back to HF repo {repo}"
+        )
+    sp_path = _download_sb_tokenizer(cache_dir=cache_dir, repo=repo)
+    return SpeechBrainTokenizer(sp_path)

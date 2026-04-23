@@ -14,6 +14,10 @@ model:
   encoder_hidden_dropout: 0.05
   encoder_attention_dropout: 0.05
   encoder_activation_dropout: 0.05
+  # Stochastic depth (uniform layer-drop during training). Conformer paper
+  # standard is ~0.1; doubles as regularization and breaks the epoch-9 peak-
+  # then-regress overfit seen on the prior run.
+  encoder_layerdrop: 0.1
   # Log-Mel frontend. 80 bins, 25 ms window, 10 ms hop — 100 Hz frame rate,
   # then the Conv2d subsampling stem in the encoder downsamples to ~25 Hz.
   n_mels: 80
@@ -40,8 +44,11 @@ data:
   test_split: test.clean
   sampling_rate: 16000
   max_audio_seconds: 20.0
-  num_proc: 40        # one worker per core on the 40-core node; thread pools are pinned to 1 in scripts/preprocess.py so they don't oversubscribe
-  tokenizer_dir: tokenizer
+  num_proc: 0         # 0 = autodetect (sched_getaffinity on Linux, os.cpu_count() elsewhere); thread pools are pinned to 1 in scripts/preprocess.py so they don't oversubscribe
+  # null → fetch SB's pretrained SentencePiece from HF Hub into cache_dir.
+  # Point at a local directory (e.g. a previous run's outputs/run/final) to
+  # reuse that run's saved sentencepiece.model; otherwise falls through to Hub.
+  tokenizer_dir: null
   cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache   # HF datasets + transformers cache
 
 train:
@@ -74,6 +81,11 @@ train:
   seed: 42
   generation_max_length: 300
   generation_num_beams: 1
+  # Stochastic Weight Averaging: maintain a per-epoch running mean of weights
+  # from 75% of the schedule onward, save to <output_dir>/final-swa/ at
+  # train end. Evaluate separately via evaluate.py --checkpoint <dir>.
+  swa_enabled: true
+  swa_start_frac: 0.75
 
 wandb:
   enabled: true

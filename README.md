@@ -43,14 +43,13 @@ This fetches all seven splits (train-clean-100/360, train-other-500, validation-
 > and sets the env vars up front. To force a different location outside the
 > YAML / CLI, export `HF_HOME_OVERRIDE=/some/path` — it wins over everything.
 
-## 1. Build the tokenizer
+## 1. Tokenizer
 
-```bash
-python scripts/prepare_tokenizer.py --subset all960 --vocab_size 1000
-# → writes ./tokenizer/
-```
-
-Use `--subset clean100` to train the BPE on just `train-clean-100` (faster; same alphabet).
+No separate step — `scripts/train.py` fetches SpeechBrain's pretrained SentencePiece
+(`speechbrain/asr-transformer-transformerlm-librispeech`, 5K unigram, uppercase)
+from HF Hub into `cache_dir` on first run. Override via `data.tokenizer_dir`
+in the YAML to point at a local directory containing `sentencepiece.model`
+(e.g. a previous run's `final/` dir) if you want to reuse a saved copy.
 
 ## 2. Train
 
@@ -123,6 +122,6 @@ The default config (`configs/conformer_small.yaml`) targets ~50 M parameters and
 
 ```
 conformer_asr/   # library code (importable)
-scripts/         # entrypoints (prepare_tokenizer, train, evaluate)
+scripts/         # entrypoints (preprocess, train, evaluate)
 configs/         # YAML hyperparameter configs
 ```

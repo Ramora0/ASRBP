@@ -29,10 +29,55 @@ from conformer_asr.tokenizer import load_tokenizer, normalize_text  # noqa: E402
 from conformer_asr.wandb_utils import init_wandb  # noqa: E402
 
 
+def _load_ckpt_state(ckpt_path: Path) -> dict[str, torch.Tensor]:
+    safetensors_file = ckpt_path / "model.safetensors"
+    pt_file = ckpt_path / "pytorch_model.bin"
+    if safetensors_file.exists():
+        from safetensors.torch import load_file
+
+        return load_file(str(safetensors_file))
+    if pt_file.exists():
+        return torch.load(str(pt_file), map_location="cpu")
+    raise FileNotFoundError(f"No model.safetensors or pytorch_model.bin in {ckpt_path}")
+
+
+def _average_state_dicts(states: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    # Equal-weight average. Keys must match across all state dicts; floating-
+    # point tensors are averaged in fp32 then cast back to the base dtype;
+    # integer buffers (e.g. position indices) are left as the first dict's copy.
+    base = states[0]
+    base_keys = set(base.keys())
+    for i, s in enumerate(states[1:], start=1):
+        if set(s.keys()) != base_keys:
+            missing = base_keys - set(s.keys())
+            extra = set(s.keys()) - base_keys
+            raise ValueError(
+                f"state_dict keys mismatch between ckpt 0 and ckpt {i}: "
+                f"missing={list(missing)[:5]}, extra={list(extra)[:5]}"
+            )
+    averaged: dict[str, torch.Tensor] = {}
+    n = len(states)
+    for name, base_tensor in base.items():
+        if not base_tensor.is_floating_point():
+            averaged[name] = base_tensor.clone()
+            continue
+        acc = base_tensor.detach().float().clone()
+        for s in states[1:]:
+            acc += s[name].detach().float()
+        averaged[name] = (acc / n).to(base_tensor.dtype)
+    return averaged
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="configs/conformer_small.yaml")
     p.add_argument("--checkpoint", required=True, help="Path to saved model directory")
+    p.add_argument(
+        "--avg_checkpoints",
+        nargs="+",
+        default=None,
+        help="Optional extra checkpoint dirs to equal-weight average with --checkpoint (SWA-style).",
+    )
     p.add_argument("--tokenizer_dir", default=None)
     p.add_argument("--split", default="test.clean")
     p.add_argument("--num_beams", type=int, default=5)
@@ -46,6 +91,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--output_json", default="results/wer.json")
     p.add_argument("--cache_dir", default=None, help="overrides data.cache_dir")
+    # --- LM rescoring (n-best). 0.0 disables; otherwise rescores the beam. ---
+    p.add_argument(
+        "--lm_weight",
+        type=float,
+        default=0.0,
+        help="Weight on SpeechBrain TransformerLM log-prob in n-best rescoring. 0 disables.",
+    )
+    p.add_argument(
+        "--len_penalty",
+        type=float,
+        default=0.0,
+        help="Per-token bonus added to rescored score (β in α·acoustic + lm_weight·lm + β·len).",
+    )
+    p.add_argument(
+        "--lm_repo",
+        default="speechbrain/asr-transformer-transformerlm-librispeech",
+        help="HF repo id for the rescoring LM; expects lm.ckpt + tokenizer.ckpt.",
+    )
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--wandb_run_name", dest="run_name", default=None)
     p.add_argument("--wandb_tags", dest="tags", default=None, help="comma-separated")
@@ -70,7 +133,7 @@ def main() -> None:
         cfg.wandb.enabled = False
 
     tokenizer_dir = args.tokenizer_dir or cfg.data.tokenizer_dir
-    tokenizer = load_tokenizer(tokenizer_dir)
+    tokenizer = load_tokenizer(tokenizer_dir, cache_dir=cfg.data.cache_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Rebuild the architecture via ``build_model`` (which wires in the custom
@@ -79,21 +142,16 @@ def main() -> None:
     # (raw-waveform CNN frontend) because ``MelConformerEncoder`` isn't a
     # registered HF model, and then ``generate()`` would try to convolve a
     # raw-waveform kernel over the log-Mel features.
-    print(f"Building model architecture and loading weights from {args.checkpoint} (device={device})")
     model = build_model(cfg.model, tokenizer)
-    ckpt_path = Path(args.checkpoint)
-    safetensors_file = ckpt_path / "model.safetensors"
-    pt_file = ckpt_path / "pytorch_model.bin"
-    if safetensors_file.exists():
-        from safetensors.torch import load_file
-
-        state = load_file(str(safetensors_file))
-    elif pt_file.exists():
-        state = torch.load(str(pt_file), map_location="cpu")
+    ckpt_paths = [Path(args.checkpoint)] + [Path(p) for p in (args.avg_checkpoints or [])]
+    if len(ckpt_paths) == 1:
+        print(f"Building model architecture and loading weights from {ckpt_paths[0]} (device={device})")
+        state = _load_ckpt_state(ckpt_paths[0])
     else:
-        raise FileNotFoundError(
-            f"No model.safetensors or pytorch_model.bin in {ckpt_path}"
-        )
+        print(f"Building model architecture and averaging {len(ckpt_paths)} checkpoints (device={device}):")
+        for p in ckpt_paths:
+            print(f"  - {p}")
+        state = _average_state_dicts([_load_ckpt_state(p) for p in ckpt_paths])
     missing, unexpected = model.load_state_dict(state, strict=False)
     total_keys = len(state)
     loaded = total_keys - len(unexpected)
@@ -130,13 +188,27 @@ def main() -> None:
         cfg,
         extra_config={
             "checkpoint": args.checkpoint,
+            "avg_checkpoints": args.avg_checkpoints,
             "split": args.split,
             "num_beams": args.num_beams,
             "batch_size": args.batch_size,
             "max_samples": args.max_samples or len(ds),
+            "lm_weight": args.lm_weight,
+            "len_penalty": args.len_penalty,
+            "lm_repo": args.lm_repo if args.lm_weight > 0 else None,
         },
         job_type="eval",
     )
+
+    rescore = args.lm_weight > 0
+    lm_scorer = None
+    if rescore:
+        from conformer_asr.sb_lm import SBLMScorer
+
+        print(f"Loading SpeechBrain LM from {args.lm_repo} (device={device})")
+        lm_scorer = SBLMScorer.from_hub(
+            repo=args.lm_repo, device=device, cache_dir=cfg.data.cache_dir
+        )
 
     preds_all: list[str] = []
     refs_all: list[str] = []
@@ -169,15 +241,52 @@ def main() -> None:
         attention_mask = attention_mask.to(device)
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_autocast):
-            generated = model.generate(
-                input_features=input_features,
-                attention_mask=attention_mask,
-                num_beams=args.num_beams,
-                max_length=cfg.train.generation_max_length,
-                no_repeat_ngram_size=args.no_repeat_ngram_size,
-                repetition_penalty=args.repetition_penalty,
+            if rescore:
+                # Pull back the full beam + per-sequence acoustic scores so we
+                # can rerank with the external LM.
+                gen = model.generate(
+                    input_features=input_features,
+                    attention_mask=attention_mask,
+                    num_beams=args.num_beams,
+                    num_return_sequences=args.num_beams,
+                    max_length=cfg.train.generation_max_length,
+                    no_repeat_ngram_size=args.no_repeat_ngram_size,
+                    repetition_penalty=args.repetition_penalty,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+                # sequences: (B*beam, L); sequences_scores: (B*beam,) sum log-probs (length-normalized
+                # by HF's default length_penalty=1.0 applied internally — that's baseline already).
+                seqs = gen.sequences
+                ac_scores = gen.sequences_scores
+            else:
+                seqs = model.generate(
+                    input_features=input_features,
+                    attention_mask=attention_mask,
+                    num_beams=args.num_beams,
+                    max_length=cfg.train.generation_max_length,
+                    no_repeat_ngram_size=args.no_repeat_ngram_size,
+                    repetition_penalty=args.repetition_penalty,
+                )
+                ac_scores = None
+
+        if rescore:
+            bsz = len(audios)
+            k = args.num_beams
+            hyp_texts = tokenizer.batch_decode(seqs, skip_special_tokens=True)
+            # LM expects uppercase (SB's SentencePiece was trained on uppercase LibriSpeech text).
+            lm_scores = lm_scorer.score_hypotheses(hyp_texts)  # (B*k,)
+            # Token lengths post-detokenize; use word count as a proxy for the length-penalty term
+            # since the acoustic score is already length-normalized by HF's default.
+            word_lens = torch.tensor(
+                [max(1, len(t.split())) for t in hyp_texts], dtype=torch.float32
             )
-        preds = tokenizer.batch_decode(generated, skip_special_tokens=True)
+            total = ac_scores.cpu().float() + args.lm_weight * lm_scores + args.len_penalty * word_lens
+            total = total.view(bsz, k)
+            best = total.argmax(dim=1)  # (B,)
+            preds = [hyp_texts[i * k + best[i].item()] for i in range(bsz)]
+        else:
+            preds = tokenizer.batch_decode(seqs, skip_special_tokens=True)
         refs = [normalize_text(t) for t in batch["text"]]
         preds_all.extend(preds)
         refs_all.extend(refs)
@@ -185,10 +294,14 @@ def main() -> None:
     score = compute_wer(preds_all, refs_all)
     result = {
         "checkpoint": args.checkpoint,
+        "avg_checkpoints": args.avg_checkpoints,
         "split": args.split,
         "num_beams": args.num_beams,
         "no_repeat_ngram_size": args.no_repeat_ngram_size,
         "repetition_penalty": args.repetition_penalty,
+        "lm_weight": args.lm_weight,
+        "len_penalty": args.len_penalty,
+        "lm_repo": args.lm_repo if args.lm_weight > 0 else None,
         "num_samples": len(preds_all),
         "wer": float(score),
     }

@@ -50,6 +50,7 @@ from conformer_asr.data import (  # noqa: E402
     _preprocess_cache_key,
     load_librispeech,
     preprocess_dataset,
+    resolve_num_proc,
     setup_cache_dir,
 )
 from conformer_asr.tokenizer import load_tokenizer  # noqa: E402
@@ -85,9 +86,15 @@ def main() -> None:
     cfg = load_config(args.config, overrides=_flatten_overrides(args))
     setup_cache_dir(cfg.data.cache_dir)
 
-    key = _preprocess_cache_key(cfg.model, load_tokenizer(cfg.data.tokenizer_dir), cfg.data)
+    key = _preprocess_cache_key(
+        cfg.model,
+        load_tokenizer(cfg.data.tokenizer_dir, cache_dir=cfg.data.cache_dir),
+        cfg.data,
+    )
     save_dir = _preprocess_cache_dir(cfg.data, key)
-    print(f"[preprocess] subset={cfg.data.subset}  num_proc={cfg.data.num_proc}")
+    resolved_num_proc = resolve_num_proc(cfg.data.num_proc)
+    auto_note = " (autodetected)" if cfg.data.num_proc <= 0 else ""
+    print(f"[preprocess] subset={cfg.data.subset}  num_proc={resolved_num_proc}{auto_note}")
     print(f"[preprocess] mel: n_mels={cfg.model.n_mels} n_fft={cfg.model.n_fft} hop={cfg.model.hop_length}")
     print(f"[preprocess] cache_dir:  {cfg.data.cache_dir}")
     print(f"[preprocess] output dir: {save_dir}")
@@ -95,7 +102,7 @@ def main() -> None:
         print("[preprocess] cache already populated — nothing to do.")
         return
 
-    tokenizer = load_tokenizer(cfg.data.tokenizer_dir)
+    tokenizer = load_tokenizer(cfg.data.tokenizer_dir, cache_dir=cfg.data.cache_dir)
 
     t0 = time.perf_counter()
     print("[preprocess] loading LibriSpeech …")

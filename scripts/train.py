@@ -54,6 +54,7 @@ from conformer_asr.wandb_utils import (  # noqa: E402
     CTCEvalCallback,
     EpochLoggerCallback,
     PredictionsTableCallback,
+    SWACallback,
     init_wandb,
     wandb_is_enabled,
 )
@@ -397,8 +398,8 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 
-    print(f"Loading tokenizer from {cfg.data.tokenizer_dir}")
-    tokenizer = load_tokenizer(cfg.data.tokenizer_dir)
+    print(f"Loading tokenizer (local_path={cfg.data.tokenizer_dir}, cache_dir={cfg.data.cache_dir})")
+    tokenizer = load_tokenizer(cfg.data.tokenizer_dir, cache_dir=cfg.data.cache_dir)
 
     # Under DDP, N ranks calling preprocess_dataset() concurrently would race on
     # save_to_disk() and duplicate 100+ GB of feature extraction. Require the
@@ -541,6 +542,13 @@ def main() -> None:
     # Must run AFTER EmptyCacheCallback has done its work but order here doesn't
     # matter; on_save only needs the saved directory to exist on disk.
     callbacks.append(EpochCheckpointRenameCallback())
+    if cfg.train.swa_enabled:
+        callbacks.append(
+            SWACallback(
+                start_frac=cfg.train.swa_start_frac,
+                save_dir=Path(cfg.train.output_dir) / "final-swa",
+            )
+        )
 
     trainer_cls = HybridSeq2SeqTrainer if cfg.model.ctc_enabled else Seq2SeqTrainer
     trainer = trainer_cls(

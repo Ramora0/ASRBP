@@ -320,6 +320,11 @@ class CTCEvalCallback(TrainerCallback):
 
         preds_all: list[str] = []
         refs_all: list[str] = []
+        # Weighted average: each batch contributes ctc_loss × n_frames so the
+        # dataset-level mean matches what an unbatched pass would produce
+        # (otherwise short-audio batches would be under-weighted vs long ones).
+        ctc_loss_sum = 0.0
+        ctc_loss_frames = 0
 
         use_autocast = (
             device.type == "cuda"
@@ -336,7 +341,14 @@ class CTCEvalCallback(TrainerCallback):
                     batch = self.data_collator(batch_feats)
                     input_features = batch["input_features"].to(device)
                     attention_mask = batch["attention_mask"].to(device)
-                    labels = batch["labels"]
+                    labels = batch["labels"].to(device)
+                    # Forward decoder_input_ids explicitly. The collator
+                    # precomputes it (shift_right of labels); relying on
+                    # SpeechEncoderDecoderModel.forward to derive it from
+                    # ``labels`` is brittle across transformers versions —
+                    # when it silently doesn't fire, BartDecoder gets called
+                    # with both inputs unset and raises.
+                    decoder_input_ids = batch["decoder_input_ids"].to(device)
 
                     autocast_ctx = (
                         torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
@@ -347,12 +359,18 @@ class CTCEvalCallback(TrainerCallback):
                         outputs = unwrapped(
                             input_features=input_features,
                             attention_mask=attention_mask,
-                            labels=None,
+                            decoder_input_ids=decoder_input_ids,
+                            labels=labels,
                         )
 
                     ctc_logits = outputs.ctc_logits
                     enc_mask = outputs.encoder_attention_mask
                     input_lengths = enc_mask.sum(-1).long() if enc_mask is not None else None
+                    batch_frames = int(input_lengths.sum().item()) if input_lengths is not None else ctc_logits.size(1) * ctc_logits.size(0)
+
+                    if outputs.ctc_loss is not None and batch_frames > 0:
+                        ctc_loss_sum += float(outputs.ctc_loss.detach().float().item()) * batch_frames
+                        ctc_loss_frames += batch_frames
 
                     pred_ids = ctc_greedy_decode(
                         ctc_logits.float(),
@@ -371,18 +389,25 @@ class CTCEvalCallback(TrainerCallback):
                 unwrapped.train()
 
         wer = compute_wer(preds_all, refs_all)
+        ctc_loss_mean = (ctc_loss_sum / ctc_loss_frames) if ctc_loss_frames > 0 else None
 
         if metrics is not None:
             metrics["eval/ctc_wer"] = float(wer)
+            if ctc_loss_mean is not None:
+                metrics["eval/ctc_loss"] = float(ctc_loss_mean)
 
         wandb = self._ensure_wandb()
         if wandb is not None:
-            wandb.log(
-                {
-                    "eval/ctc_wer": float(wer),
-                    "epoch": state.epoch,
-                    "train/global_step": state.global_step,
-                },
-                step=state.global_step,
-            )
-        print(f"[ctc-eval] step={state.global_step} epoch={state.epoch} ctc_wer={wer:.4f}")
+            payload = {
+                "eval/ctc_wer": float(wer),
+                "epoch": state.epoch,
+                "train/global_step": state.global_step,
+            }
+            if ctc_loss_mean is not None:
+                payload["eval/ctc_loss"] = float(ctc_loss_mean)
+            wandb.log(payload, step=state.global_step)
+        loss_str = f" ctc_loss={ctc_loss_mean:.4f}" if ctc_loss_mean is not None else ""
+        print(
+            f"[ctc-eval] step={state.global_step} epoch={state.epoch} "
+            f"ctc_wer={wer:.4f}{loss_str}"
+        )

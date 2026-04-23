@@ -101,6 +101,7 @@ class DualProgressCallback(TrainerCallback):
     def __init__(self) -> None:
         self.overall_bar = None
         self.epoch_bar = None
+        self.eval_bar = None
         self._last_global_step = 0
 
     def on_train_begin(self, args, state, control, **kwargs):
@@ -153,10 +154,37 @@ class DualProgressCallback(TrainerCallback):
             self.epoch_bar.close()
             self.epoch_bar = None
 
+    def on_prediction_step(self, args, state, control, eval_dataloader=None, **kwargs):
+        # Fires per eval batch. Replaces HF's default ProgressCallback eval bar
+        # (which we removed to avoid dueling train bars).
+        if not state.is_world_process_zero:
+            return
+        from tqdm.auto import tqdm
+
+        if self.eval_bar is None:
+            total = len(eval_dataloader) if eval_dataloader is not None and hasattr(eval_dataloader, "__len__") else None
+            self.eval_bar = tqdm(
+                total=total,
+                desc="eval",
+                position=2,
+                leave=False,
+                dynamic_ncols=True,
+                unit="batch",
+            )
+        self.eval_bar.update(1)
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        if self.eval_bar is not None:
+            self.eval_bar.close()
+            self.eval_bar = None
+
     def on_train_end(self, args, state, control, **kwargs):
         if self.epoch_bar is not None:
             self.epoch_bar.close()
             self.epoch_bar = None
+        if self.eval_bar is not None:
+            self.eval_bar.close()
+            self.eval_bar = None
         if self.overall_bar is not None:
             self.overall_bar.close()
             self.overall_bar = None
@@ -203,7 +231,17 @@ class HybridSeq2SeqTrainer(Seq2SeqTrainer):
 
     A model without a CTC head falls back to the normal AED-only path so this
     trainer is safe to use regardless of ``ctc_enabled``.
+
+    Also tracks per-step AED / CTC loss sums so they can be surfaced as
+    ``train/aed_loss`` and ``train/ctc_loss`` on the next ``log()`` boundary,
+    mirroring how HF's built-in ``tr_loss`` accumulator drives ``train/loss``.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._aed_loss_sum = 0.0
+        self._ctc_loss_sum = 0.0
+        self._loss_component_count = 0
 
     def compute_loss(
         self,
@@ -236,7 +274,28 @@ class HybridSeq2SeqTrainer(Seq2SeqTrainer):
         else:
             loss = aed_loss
 
+        # Accumulate component sums for the next ``log()`` emission. Detaching
+        # first so we don't retain autograd graphs across steps.
+        if aed_loss is not None:
+            self._aed_loss_sum += float(aed_loss.detach().float().item())
+        if ctc_loss is not None:
+            self._ctc_loss_sum += float(ctc_loss.detach().float().item())
+        self._loss_component_count += 1
+
         return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs, *args, **kwargs):
+        # HF fires ``log()`` for both training (``loss`` key) and eval
+        # (``eval_loss`` key). Only inject / reset on training log boundaries —
+        # eval-time CTC loss is reported separately by CTCEvalCallback.
+        if "loss" in logs and self._loss_component_count > 0:
+            denom = float(self._loss_component_count)
+            logs["train/aed_loss"] = self._aed_loss_sum / denom
+            logs["train/ctc_loss"] = self._ctc_loss_sum / denom
+            self._aed_loss_sum = 0.0
+            self._ctc_loss_sum = 0.0
+            self._loss_component_count = 0
+        return super().log(logs, *args, **kwargs)
 
 
 def parse_args() -> argparse.Namespace:

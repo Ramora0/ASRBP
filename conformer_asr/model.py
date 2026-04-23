@@ -441,6 +441,20 @@ class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
                 encoder_hidden.size(1), attention_mask
             )
 
+        # Derive decoder_input_ids from labels ourselves when the caller didn't
+        # provide them. SpeechEncoderDecoderModel.forward does the same
+        # shift-right internally, but whether it fires is gated on transformers
+        # internals that have been brittle across versions — when it doesn't,
+        # BartDecoder gets called with both input_ids and inputs_embeds unset
+        # and raises. Doing it up front here makes the decoder call deterministic.
+        if decoder_input_ids is None and labels is not None:
+            pad_id = self.config.pad_token_id
+            bos_id = self.config.decoder_start_token_id
+            shifted = labels.new_zeros(labels.shape)
+            shifted[:, 1:] = labels[:, :-1].clone()
+            shifted[:, 0] = bos_id
+            decoder_input_ids = shifted.masked_fill(shifted == -100, pad_id)
+
         # AED path — delegate to the parent, reusing our encoder outputs.
         aed_outputs = super().forward(
             attention_mask=attention_mask,

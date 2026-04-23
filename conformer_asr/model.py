@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from torch.nn import CrossEntropyLoss
 from transformers import (
     BartConfig,
     BartForCausalLM,
@@ -8,8 +9,94 @@ from transformers import (
     Wav2Vec2ConformerConfig,
     Wav2Vec2ConformerModel,
 )
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 from .config import ModelConfig
+
+
+class _CompatBartForCausalLM(BartForCausalLM):
+    """Work around a long-standing interaction bug between
+    ``SpeechEncoderDecoderModel`` and ``BartForCausalLM``: the outer model
+    passes ``input_ids``, BartForCausalLM.forward internally also builds
+    ``inputs_embeds`` and forwards both down to ``BartDecoder``, which rejects
+    the combination. We bypass ``BartForCausalLM.forward`` entirely: pre-embed
+    the ids ourselves and pass only ``inputs_embeds`` into the inner decoder,
+    then apply the LM head. Loss is (re)computed here if ``labels`` is given,
+    mirroring the parent's behavior.
+    """
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        head_mask=None,
+        cross_attn_head_mask=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        if input_ids is not None:
+            bart_decoder = self.model.decoder
+            embed_scale = getattr(bart_decoder, "embed_scale", 1.0)
+            inputs_embeds = bart_decoder.embed_tokens(input_ids) * embed_scale
+            input_ids = None
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.model.decoder(
+            input_ids=None,
+            attention_mask=attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            head_mask=head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+        )
+
+        logits = self.lm_head(outputs[0])
+
+        loss = None
+        if labels is not None:
+            labels = labels.to(logits.device)
+            loss = CrossEntropyLoss()(
+                logits.view(-1, self.config.vocab_size),
+                labels.view(-1),
+            )
+
+        if not return_dict:
+            output = (logits,) + tuple(
+                v for v in (
+                    outputs.past_key_values,
+                    outputs.hidden_states,
+                    outputs.attentions,
+                    outputs.cross_attentions,
+                )
+                if v is not None
+            )
+            return ((loss,) + output) if loss is not None else output
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            cross_attentions=outputs.cross_attentions,
+        )
 
 
 def _build_encoder_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
@@ -71,7 +158,7 @@ def build_model(mcfg: ModelConfig, tokenizer: PreTrainedTokenizerFast) -> Speech
     dec_cfg = _build_decoder_config(mcfg, len(tokenizer), pad_id, bos_id, eos_id)
 
     encoder = Wav2Vec2ConformerModel(enc_cfg)
-    decoder = BartForCausalLM(dec_cfg)
+    decoder = _CompatBartForCausalLM(dec_cfg)
     model = SpeechEncoderDecoderModel(encoder=encoder, decoder=decoder)
 
     # Wire special tokens at the top-level config so generate() picks them up.

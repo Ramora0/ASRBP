@@ -8,7 +8,27 @@ import yaml
 
 
 @dataclass
+class DownsamplerConfig:
+    """Spectrogram → transformer-input bridge module (see
+    ``conformer_asr/downsamplers/``).
+
+    ``type`` selects an entry in ``downsamplers.DOWNSAMPLERS``; ``kwargs`` is
+    passed through to that implementation's constructor, so adding a new
+    downsampler doesn't require touching this schema. The default ``conv2d``
+    stem takes ``num_convs`` (first two are stride ``(2, 2)``, extras are
+    time-only stride ``(2, 1)``).
+    """
+
+    type: str = "conv2d"
+    kwargs: dict[str, Any] = field(default_factory=lambda: {"num_convs": 2})
+
+
+@dataclass
 class ModelConfig:
+    # Architecture selectors. See ``conformer_asr/encoders/`` and
+    # ``conformer_asr/decoders/`` for the registered families.
+    encoder_type: str
+    decoder_type: str
     encoder_hidden_size: int
     encoder_num_hidden_layers: int
     encoder_num_attention_heads: int
@@ -25,8 +45,8 @@ class ModelConfig:
     # enough in practice). ~0.1 is standard for Conformer.
     encoder_layerdrop: float
     # Log-Mel frontend (see conformer_asr/features.py). Mel features are
-    # computed offline at preprocess time; the encoder's Conv2d subsampling
-    # stem consumes them directly — no waveform feature encoder.
+    # computed offline at preprocess time; the encoder's downsampler stem
+    # consumes them directly — no waveform feature encoder.
     n_mels: int
     n_fft: int
     hop_length: int
@@ -44,6 +64,9 @@ class ModelConfig:
     # eval time (``CTCEvalCallback`` in ``wandb_utils``).
     ctc_enabled: bool
     ctc_weight: float
+    # Spectrogram → transformer-input bridge. Nested so the downsampler family
+    # can carry its own knobs without bloating the top-level ``ModelConfig``.
+    downsampler: DownsamplerConfig = field(default_factory=DownsamplerConfig)
 
 
 @dataclass
@@ -135,6 +158,16 @@ class Config:
         return asdict(self)
 
 
+def _build_model_config(raw: dict[str, Any]) -> ModelConfig:
+    raw = dict(raw)
+    ds_raw = raw.get("downsampler")
+    if isinstance(ds_raw, dict):
+        raw["downsampler"] = DownsamplerConfig(**ds_raw)
+    elif ds_raw is None:
+        raw["downsampler"] = DownsamplerConfig()
+    return ModelConfig(**raw)
+
+
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Config:
     """Load config from YAML. YAML is the single source of truth for values;
     dataclasses only define the schema. Every field must be present in YAML —
@@ -143,13 +176,15 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
     with open(path) as fh:
         raw = yaml.safe_load(fh) or {}
     cfg = Config(
-        model=ModelConfig(**raw.get("model", {})),
+        model=_build_model_config(raw.get("model", {})),
         data=DataConfig(**raw.get("data", {})),
         train=TrainConfig(**raw.get("train", {})),
         wandb=WandbConfig(**raw.get("wandb", {})),
     )
     if overrides:
         # Flat overrides are applied to whichever section owns the key.
+        # Nested sub-configs (e.g. ``model.downsampler``) aren't reachable from
+        # the flat CLI surface — edit the YAML for those.
         for key, val in overrides.items():
             if val is None:
                 continue

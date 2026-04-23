@@ -1,4 +1,8 @@
 model:
+  # Architecture selectors — see conformer_asr/{encoders,decoders}/__init__.py
+  # for the registered options.
+  encoder_type: conformer
+  decoder_type: bart
   # Encoder matches Conformer-M (Gulati et al. 2020, Table 1): 16 layers, 256 dim,
   # 4 heads, FFN expansion 4× → ~30M encoder params. Paper's conv kernel is 32;
   # HF defaults to 31 — functionally equivalent.
@@ -19,10 +23,19 @@ model:
   # then-regress overfit seen on the prior run.
   encoder_layerdrop: 0.1
   # Log-Mel frontend. 80 bins, 25 ms window, 10 ms hop — 100 Hz frame rate,
-  # then the Conv2d subsampling stem in the encoder downsamples to ~25 Hz.
+  # then the downsampler stem (see `downsampler` below) reduces to ~25 Hz.
   n_mels: 80
   n_fft: 400
   hop_length: 160
+  # Spectrogram → transformer-input bridge. `conv2d` is the standard ASR stem:
+  # first two Conv2d(k=3, s=2) layers downsample both time and mel axes (4×
+  # time reduction on 80-mel input); any extra convs beyond the first two are
+  # stride (2, 1), adding additional time-only downsampling (8× at num_convs=3,
+  # 16× at 4). See conformer_asr/downsamplers/ for registered options.
+  downsampler:
+    type: conv2d
+    kwargs:
+      num_convs: 2
   # AED decoder (not in the paper; they used RNN-T). Kept small and proportional
   # to the encoder so total model lands around ~35M params.
   decoder_d_model: 256

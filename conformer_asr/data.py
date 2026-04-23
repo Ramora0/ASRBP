@@ -194,6 +194,13 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     the decoder expects as its first token is added by the model's
     ``shift_tokens_right`` using ``decoder_start_token_id`` — so we strip the leading
     BOS from labels to avoid duplicating it.
+
+    We also precompute ``decoder_input_ids`` here. ``Seq2SeqTrainer.compute_loss``
+    pops ``labels`` from inputs before calling the model when a label smoother is
+    active (``label_smoothing_factor > 0``); without ``labels``,
+    ``SpeechEncoderDecoderModel.forward`` won't derive ``decoder_input_ids``
+    itself, and the decoder then gets called with both ids/embeds unset — which
+    BartDecoder rejects. Providing ``decoder_input_ids`` in the batch avoids that.
     """
 
     feature_extractor: Wav2Vec2FeatureExtractor
@@ -225,4 +232,15 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         if (labels[:, 0] == self.decoder_start_token_id).all():
             labels = labels[:, 1:]
         batch["labels"] = labels
+        batch["decoder_input_ids"] = self._shift_right(labels)
         return batch
+
+    def _shift_right(self, labels: torch.Tensor) -> torch.Tensor:
+        """Teacher-forcing inputs: prepend ``decoder_start_token_id`` and shift
+        right, replacing -100 (ignore index) with ``pad_token_id`` so the
+        embedding lookup is valid at those positions."""
+        pad_id = self.tokenizer.pad_token_id
+        shifted = labels.new_zeros(labels.shape)
+        shifted[:, 1:] = labels[:, :-1].clone()
+        shifted[:, 0] = self.decoder_start_token_id
+        return shifted.masked_fill(shifted == -100, pad_id)

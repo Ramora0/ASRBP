@@ -113,6 +113,11 @@ def main() -> None:
             report_to="none",
             use_cpu=not torch.cuda.is_available(),
             remove_unused_columns=False,
+            # label_smoothing_factor > 0 makes Trainer pop `labels` from inputs
+            # before calling model.forward — SpeechEncoderDecoderModel then can't
+            # derive decoder_input_ids, and BartDecoder rejects the resulting
+            # all-None call. Keep this ON here to catch that regression.
+            label_smoothing_factor=0.1,
         )
         trainer = Seq2SeqTrainer(
             model=model,

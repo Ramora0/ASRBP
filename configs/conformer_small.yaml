@@ -57,11 +57,11 @@ data:
 
 train:
   output_dir: outputs/run
-  per_device_train_batch_size: 32
+  per_device_train_batch_size: 64
   per_device_eval_batch_size: 8
   # 4 × V100 × 64 × 1 = 256 effective batch. Matches the single-GPU target so
   # LR / warmup schedules stay directly comparable across hardware configs.
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   learning_rate: 1.0e-3
   # Fixed-step warmup (ESPnet / SpeechBrain / Gulati all use absolute steps,
   # not a ratio). 2500 steps at eff batch 256 ≈ 2.3 epochs of all960 warmup.

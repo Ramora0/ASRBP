@@ -52,6 +52,7 @@ class SpeechBrainTokenizer:
     bos_token_id: int = SB_BOS_ID
     eos_token_id: int = SB_EOS_ID
     unk_token_id: int = SB_UNK_ID
+    model_input_names: list[str] = ["input_ids", "attention_mask"]
 
     def __init__(self, sp_model_path: str | Path):
         import sentencepiece as spm
@@ -63,12 +64,15 @@ class SpeechBrainTokenizer:
     def __len__(self) -> int:
         return self.sp.get_piece_size()
 
-    def __call__(self, text: str) -> dict[str, list[int]]:
+    def __call__(self, text: str):
         # BOS/EOS framing mirrors the old TemplateProcessing post-processor so
         # the collator's leading-BOS strip (see DataCollatorSpeechSeq2SeqWithPadding)
-        # keeps working unchanged.
+        # keeps working unchanged. Return a BatchEncoding so callers can use
+        # either `.input_ids` (HF attribute style) or `["input_ids"]`.
+        from transformers import BatchEncoding
+
         ids = [self.bos_token_id] + self.sp.encode(text, out_type=int) + [self.eos_token_id]
-        return {"input_ids": ids}
+        return BatchEncoding({"input_ids": ids})
 
     def _strip_special(self, ids: Sequence[int]) -> list[int]:
         specials = {self.pad_token_id, self.bos_token_id, self.eos_token_id, self.unk_token_id}

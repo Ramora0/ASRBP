@@ -46,6 +46,18 @@ def set_hf_cache_env(cache_dir: str | os.PathLike) -> str:
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(root / "hub")
     os.environ["TRANSFORMERS_CACHE"] = str(root / "transformers")
     os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
+
+    # librosa uses numba; numba writes JIT cache next to its source files by
+    # default — i.e. under site-packages in $HOME. On NFS with many parallel
+    # workers (num_proc) that produces `OSError: [Errno 116] Stale file handle`
+    # when workers race on the same .nbi file. Point numba at scratch too.
+    numba_cache = root / "numba"
+    numba_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["NUMBA_CACHE_DIR"] = str(numba_cache)
+    # matplotlib has the same NFS-contention problem on fresh nodes.
+    mpl_cache = root / "matplotlib"
+    mpl_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache))
     return cache_dir
 
 

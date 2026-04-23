@@ -161,18 +161,23 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
 
 
 def resolve_precision(train_cfg: TrainConfig) -> None:
-    """Flip bf16→fp16 on GPUs that don't support bfloat16 (e.g. V100 / Volta).
+    """Flip bf16→fp16 on GPUs that don't support bfloat16 natively (e.g. V100 / Volta).
 
     Mutates ``train_cfg`` in place. Intended to run after CLI overrides but
     before TrainingArguments / autocast dtype is built.
+
+    We gate on ``compute capability >= (8, 0)`` (Ampere+) rather than
+    ``torch.cuda.is_bf16_supported()`` because newer PyTorch versions report
+    True for V100 on the basis of *emulated* bf16 — which silently falls off
+    the fp16 tensor-core path and runs at a fraction of native throughput.
     """
     import torch
 
     if not torch.cuda.is_available():
         return
-    if train_cfg.bf16 and not torch.cuda.is_bf16_supported():
+    if train_cfg.bf16 and torch.cuda.get_device_capability(0) < (8, 0):
         device_name = torch.cuda.get_device_name(0)
-        print(f"[precision] bf16 not supported on {device_name}; using fp16.")
+        print(f"[precision] bf16 not natively supported on {device_name}; using fp16.")
         train_cfg.bf16 = False
         train_cfg.fp16 = True
 

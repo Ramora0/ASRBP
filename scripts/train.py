@@ -207,9 +207,18 @@ class EpochCheckpointRenameCallback(TrainerCallback):
     ``checkpoint-*`` and sorts by the trailing number) still prunes correctly.
     Also updates ``state.best_model_checkpoint`` so ``load_best_model_at_end``
     can find the renamed directory.
+
+    Rank-0 only: under DDP, HF fires ``on_save`` on every rank, and non-zero
+    ranks exit ``_save_checkpoint`` well before rank 0 finishes its heavy writes
+    (model → optimizer → scheduler → trainer_state). If a non-zero rank renames
+    the directory mid-flight, rank 0's ``torch.save(scheduler.state_dict(), …)``
+    lands on a vanished path and the run crashes. Keeping the rename on rank 0
+    serializes it after rank 0's own ``_save_checkpoint`` returns.
     """
 
     def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
         from pathlib import Path as _Path
 
         step_dir = _Path(args.output_dir) / f"checkpoint-{state.global_step}"

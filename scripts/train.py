@@ -41,6 +41,7 @@ from transformers.trainer_callback import ProgressCallback  # noqa: E402
 from conformer_asr.config import autocast_dtype, load_config, resolve_precision  # noqa: E402
 from conformer_asr.data import (  # noqa: E402
     DataCollatorSpeechSeq2SeqWithPadding,
+    RandomSpeedVariantSampler,
     _preprocess_cache_dir,
     _preprocess_cache_key,
     load_librispeech,
@@ -245,7 +246,32 @@ class OneShotEvalCallback(TrainerCallback):
         return control
 
 
-class HybridSeq2SeqTrainer(Seq2SeqTrainer):
+class SpeedAugSeq2SeqTrainer(Seq2SeqTrainer):
+    """``Seq2SeqTrainer`` variant that subsamples the speed-perturbed cache.
+
+    When ``n_speed_variants > 1`` the preprocessed train split contains N
+    contiguous variant rows per clip (row ``k * n + v`` = clip ``k`` at speed
+    slot ``v``). This trainer wraps the normal train sampler in
+    ``RandomSpeedVariantSampler`` so each epoch keeps exactly one variant per
+    clip (uniform random), restoring epoch length to ``N`` instead of ``n * N``.
+    ``n_speed_variants == 1`` is a pass-through: no wrapping, stock sampler.
+    """
+
+    def __init__(self, *args, n_speed_variants: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._n_speed_variants = int(n_speed_variants)
+
+    def _get_train_sampler(self, *args, **kwargs):
+        # Seq2SeqTrainer._get_train_sampler signature drifts across transformers
+        # 4.x point releases (some take ``train_dataset``, some don't) — forward
+        # whatever we're given straight through so the wrapper stays compatible.
+        base = super()._get_train_sampler(*args, **kwargs)
+        if self._n_speed_variants > 1 and base is not None:
+            return RandomSpeedVariantSampler(base, self._n_speed_variants)
+        return base
+
+
+class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
     """``Seq2SeqTrainer`` that keeps labels in the forward pass so the model
     can compute both AED and CTC losses in one shot.
 
@@ -557,7 +583,11 @@ def main() -> None:
             )
         )
 
-    trainer_cls = HybridSeq2SeqTrainer if cfg.model.ctc_enabled else Seq2SeqTrainer
+    # Distinct speeds in the cache — if >1, the train split has that many
+    # variant rows per clip (laid out contiguously) and the Trainer will
+    # subsample to one per clip per epoch via RandomSpeedVariantSampler.
+    n_speed_variants = len({round(float(s), 4) for s in cfg.data.speed_perturbations})
+    trainer_cls = HybridSeq2SeqTrainer if cfg.model.ctc_enabled else SpeedAugSeq2SeqTrainer
     trainer = trainer_cls(
         model=model,
         args=training_args,
@@ -567,6 +597,7 @@ def main() -> None:
         compute_metrics=build_compute_metrics(tokenizer),
         processing_class=tokenizer,
         callbacks=callbacks or None,
+        n_speed_variants=n_speed_variants,
     )
     # Swap HF's single-bar ProgressCallback for our two-bar overall+epoch view.
     trainer.remove_callback(ProgressCallback)

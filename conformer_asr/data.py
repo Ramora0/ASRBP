@@ -117,6 +117,59 @@ def _speed_perturb(wav: np.ndarray, speed: float) -> np.ndarray:
     return resample_poly(wav, up=up, down=down).astype(np.float32, copy=False)
 
 
+class RandomSpeedVariantSampler(torch.utils.data.Sampler[int]):
+    """Filter a base sampler so each epoch yields one of ``n_variants`` contiguous
+    rows per original clip.
+
+    ``preprocess_dataset`` lays speed variants out contiguously: row ``k * n + v``
+    holds clip ``k`` at speed slot ``v`` for ``v`` in ``0..n-1``. We wrap the
+    Trainer's normal sampler (e.g. ``LengthGroupedSampler``) so the length-sorted
+    mega-batch shuffle still runs over all ``3N`` indices — we just drop 2 out of
+    every 3 on the way out. Net effect: each epoch sees each clip exactly once
+    at a uniformly-random speed (so epoch length = ``N``, not ``3N``), with
+    bucket grouping preserved.
+
+    Under DDP each rank filters its own shard independently, so a clip whose
+    variants land on different ranks may appear 0, 1, or 2 times that epoch
+    instead of exactly once — a minor statistical bias, not a correctness
+    issue. Fine for single-GPU; revisit if you need strict DDP accounting.
+    """
+
+    def __init__(
+        self,
+        base: torch.utils.data.Sampler[int],
+        n_variants: int,
+        generator: torch.Generator | None = None,
+    ) -> None:
+        if n_variants < 1:
+            raise ValueError(f"n_variants must be >= 1, got {n_variants}")
+        base_len = len(base)
+        if base_len % n_variants != 0:
+            raise ValueError(
+                f"base sampler length {base_len} is not a multiple of n_variants {n_variants}; "
+                "the preprocessed cache layout assumes contiguous variants per clip."
+            )
+        self._base = base
+        self._n_variants = int(n_variants)
+        self._n_clips = base_len // n_variants
+        self._generator = generator
+
+    def __len__(self) -> int:
+        return self._n_clips
+
+    def __iter__(self):
+        g = self._generator
+        if g is None:
+            g = torch.Generator()
+            g.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+        kept = torch.randint(0, self._n_variants, (self._n_clips,), generator=g).tolist()
+        for idx in self._base:
+            idx = int(idx)
+            clip_id, variant = divmod(idx, self._n_variants)
+            if variant == kept[clip_id]:
+                yield idx
+
+
 def _preprocess_cache_key(
     mcfg: ModelConfig,
     tokenizer: PreTrainedTokenizerFast,

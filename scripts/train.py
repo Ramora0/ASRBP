@@ -19,7 +19,6 @@ from transformers import (  # noqa: E402
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     TrainerCallback,
-    Wav2Vec2FeatureExtractor,
 )
 from transformers.trainer_callback import ProgressCallback  # noqa: E402
 
@@ -179,16 +178,8 @@ def main() -> None:
     print("Loading LibriSpeech …")
     ds = load_librispeech(cfg.data)
 
-    feature_extractor = Wav2Vec2FeatureExtractor(
-        feature_size=1,
-        sampling_rate=cfg.data.sampling_rate,
-        padding_value=0.0,
-        do_normalize=True,
-        return_attention_mask=True,
-    )
-
     print("Preprocessing dataset (this caches to disk after first run)")
-    ds = preprocess_dataset(ds, feature_extractor, tokenizer, cfg.data)
+    ds = preprocess_dataset(ds, cfg.model, tokenizer, cfg.data)
 
     model = build_model(cfg.model, tokenizer)
     n_params = sum(p.numel() for p in model.parameters())
@@ -214,9 +205,9 @@ def main() -> None:
         wandb_run.summary["train_dataset_size"] = len(ds["train"])
 
     collator = DataCollatorSpeechSeq2SeqWithPadding(
-        feature_extractor=feature_extractor,
         tokenizer=tokenizer,
         decoder_start_token_id=model.config.decoder_start_token_id,
+        n_mels=cfg.model.n_mels,
     )
 
     training_args = Seq2SeqTrainingArguments(
@@ -276,7 +267,7 @@ def main() -> None:
         eval_dataset=ds["validation"],
         data_collator=collator,
         compute_metrics=build_compute_metrics(tokenizer),
-        processing_class=feature_extractor,
+        processing_class=tokenizer,
         callbacks=callbacks or None,
     )
     # Swap HF's single-bar ProgressCallback for our two-bar overall+epoch view.

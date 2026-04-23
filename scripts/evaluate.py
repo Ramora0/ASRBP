@@ -16,13 +16,15 @@ print(f"HF cache_dir (bootstrapped): {_resolved_cache}")
 # -------------------------------------------------------------------------
 
 from conformer_asr.metrics import compute_wer  # noqa: E402
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from datasets import Audio, load_dataset  # noqa: E402
 from tqdm import tqdm  # noqa: E402
-from transformers import SpeechEncoderDecoderModel, Wav2Vec2FeatureExtractor  # noqa: E402
+from transformers import SpeechEncoderDecoderModel  # noqa: E402
 
 from conformer_asr.config import autocast_dtype as _autocast_dtype, load_config, resolve_precision  # noqa: E402
 from conformer_asr.data import setup_cache_dir  # noqa: E402
+from conformer_asr.features import log_mel_spectrogram  # noqa: E402
 from conformer_asr.tokenizer import load_tokenizer, normalize_text  # noqa: E402
 from conformer_asr.wandb_utils import init_wandb  # noqa: E402
 
@@ -68,13 +70,9 @@ def main() -> None:
     model = SpeechEncoderDecoderModel.from_pretrained(args.checkpoint).to(device).eval()
 
     tokenizer = load_tokenizer(tokenizer_dir)
-    feature_extractor = Wav2Vec2FeatureExtractor(
-        feature_size=1,
-        sampling_rate=cfg.data.sampling_rate,
-        padding_value=0.0,
-        do_normalize=True,
-        return_attention_mask=True,
-    )
+    n_mels = cfg.model.n_mels
+    n_fft = cfg.model.n_fft
+    hop_length = cfg.model.hop_length
 
     print(f"Loading split {args.split} (cache_dir={cfg.data.cache_dir})")
     ds = load_dataset(
@@ -112,20 +110,31 @@ def main() -> None:
 
     for start in tqdm(range(0, len(ds), args.batch_size), desc=f"generate({args.split})"):
         batch = ds[start : start + args.batch_size]
-        audios = [a["array"] for a in batch["audio"]]
-        inputs = feature_extractor(
-            audios,
-            sampling_rate=cfg.data.sampling_rate,
-            padding=True,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        input_values = inputs["input_values"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
+        audios = [np.asarray(a["array"], dtype=np.float32) for a in batch["audio"]]
+        # Compute log-Mel per sample, then right-pad to batch max along time.
+        mels = [
+            log_mel_spectrogram(
+                a,
+                n_mels=n_mels,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                sampling_rate=cfg.data.sampling_rate,
+            )
+            for a in audios
+        ]
+        lengths = [m.shape[0] for m in mels]
+        t_max = max(lengths)
+        input_features = torch.zeros((len(mels), t_max, n_mels), dtype=torch.float32)
+        attention_mask = torch.zeros((len(mels), t_max), dtype=torch.long)
+        for i, m in enumerate(mels):
+            input_features[i, : m.shape[0]] = m
+            attention_mask[i, : m.shape[0]] = 1
+        input_features = input_features.to(device)
+        attention_mask = attention_mask.to(device)
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_autocast):
             generated = model.generate(
-                input_values,
+                input_features=input_features,
                 attention_mask=attention_mask,
                 num_beams=args.num_beams,
                 max_length=cfg.train.generation_max_length,

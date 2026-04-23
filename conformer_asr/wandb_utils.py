@@ -184,7 +184,7 @@ class PredictionsTableCallback(TrainerCallback):
         model.eval()
         device = next(model.parameters()).device
         batch = self.data_collator(self.sample_features)
-        input_values = batch["input_values"].to(device)
+        input_features = batch["input_features"].to(device)
         attention_mask = batch.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
@@ -192,7 +192,7 @@ class PredictionsTableCallback(TrainerCallback):
         gen_kwargs = {"max_length": args.generation_max_length, "num_beams": 1}
         with torch.no_grad():
             generated = model.generate(
-                input_values,
+                input_features=input_features,
                 attention_mask=attention_mask,
                 **gen_kwargs,
             )

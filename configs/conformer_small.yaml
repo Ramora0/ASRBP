@@ -9,6 +9,11 @@ model:
   encoder_conv_depthwise_kernel_size: 31
   encoder_mask_time_prob: 0.05
   encoder_mask_feature_prob: 0.05
+  # Log-Mel frontend. 80 bins, 25 ms window, 10 ms hop — 100 Hz frame rate,
+  # then the Conv2d subsampling stem in the encoder downsamples to ~25 Hz.
+  n_mels: 80
+  n_fft: 400
+  hop_length: 160
   # AED decoder (not in the paper; they used RNN-T). Kept small and proportional
   # to the encoder so total model lands around ~35M params.
   decoder_d_model: 256

@@ -31,11 +31,11 @@ from transformers import (
     PreTrainedTokenizerFast,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
-    Wav2Vec2FeatureExtractor,
 )
 
-from conformer_asr.config import ModelConfig
+from conformer_asr.config import load_config
 from conformer_asr.data import DataCollatorSpeechSeq2SeqWithPadding
+from conformer_asr.features import log_mel_spectrogram
 from conformer_asr.model import build_model
 
 
@@ -60,17 +60,23 @@ def _make_dummy_tokenizer() -> PreTrainedTokenizerFast:
     )
 
 
-def _make_fake_dataset(n: int, tokenizer, feature_extractor) -> Dataset:
+def _make_fake_dataset(n: int, tokenizer, mcfg) -> Dataset:
     rng = torch.Generator().manual_seed(0)
     records = []
     for _ in range(n):
         audio = torch.randn(16000, generator=rng).numpy()
-        feats = feature_extractor(audio, sampling_rate=16000, return_tensors=None)
+        mel = log_mel_spectrogram(
+            audio,
+            n_mels=mcfg.n_mels,
+            n_fft=mcfg.n_fft,
+            hop_length=mcfg.hop_length,
+            sampling_rate=16000,
+        )
         ids = tokenizer("hello world").input_ids
         records.append(
             {
-                "input_values": feats["input_values"][0].tolist(),
-                "input_length": len(feats["input_values"][0]),
+                "input_features": mel.tolist(),
+                "input_length": int(mel.shape[0]),
                 "labels": ids,
             }
         )
@@ -84,22 +90,15 @@ def main() -> None:
     print(f"torch:        {torch.__version__}")
 
     tokenizer = _make_dummy_tokenizer()
-    feature_extractor = Wav2Vec2FeatureExtractor(
-        feature_size=1,
-        sampling_rate=16000,
-        padding_value=0.0,
-        do_normalize=True,
-        return_attention_mask=True,
-    )
 
-    mcfg = ModelConfig()
+    mcfg = load_config(Path(__file__).resolve().parent.parent / "configs/conformer_small.yaml").model
     model = build_model(mcfg, tokenizer)
 
-    train_ds = _make_fake_dataset(4, tokenizer, feature_extractor)
+    train_ds = _make_fake_dataset(4, tokenizer, mcfg)
     collator = DataCollatorSpeechSeq2SeqWithPadding(
-        feature_extractor=feature_extractor,
         tokenizer=tokenizer,
         decoder_start_token_id=model.config.decoder_start_token_id,
+        n_mels=mcfg.n_mels,
     )
 
     with tempfile.TemporaryDirectory() as tmp:

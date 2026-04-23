@@ -7,11 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from datasets import Audio, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
-from transformers import PreTrainedTokenizerFast, Wav2Vec2FeatureExtractor
+from transformers import PreTrainedTokenizerFast
 
-from .config import DataConfig
+from .config import DataConfig, ModelConfig
+from .features import log_mel_spectrogram
 from .tokenizer import normalize_text
 
 
@@ -72,39 +74,35 @@ def _duration_seconds(example: dict[str, Any], sampling_rate: int) -> float:
 
 
 def _preprocess_cache_key(
-    feature_extractor: Wav2Vec2FeatureExtractor,
+    mcfg: ModelConfig,
     tokenizer: PreTrainedTokenizerFast,
     cfg: DataConfig,
 ) -> str:
     """Stable hash of everything that affects preprocessing output.
 
-    Covers subset/eval/test splits (dataset content), audio params (filter +
-    feature extraction), FE config, and tokenizer state. Bump whenever
-    preprocessing logic itself changes.
+    Covers subset/eval/test splits (dataset content), duration filter bounds,
+    the log-Mel frontend params (n_mels/n_fft/hop_length/sampling_rate), and
+    tokenizer state. Bump ``v`` whenever the prepare() logic itself changes.
     """
     try:
         tok_repr = tokenizer.backend_tokenizer.to_str()
     except Exception:
         tok_repr = json.dumps(sorted(tokenizer.get_vocab().items()))
 
-    # Strip version-string fields that don't affect output but would otherwise
-    # invalidate the cache on every transformers upgrade/downgrade.
-    fe_dict = {
-        k: v
-        for k, v in feature_extractor.to_dict().items()
-        if k not in {"transformers_version", "_commit_hash", "_auto_class"}
-    }
-
     blob = json.dumps(
         {
-            "v": 1,  # preprocessing-logic version; bump when prepare() changes
+            "v": 2,  # bumped when switching from raw-waveform FE to log-Mel
             "dataset_id": cfg.dataset_id,
             "subset": cfg.subset,
             "eval_split": cfg.eval_split,
             "test_split": cfg.test_split,
             "sampling_rate": cfg.sampling_rate,
             "max_audio_seconds": cfg.max_audio_seconds,
-            "fe": fe_dict,
+            "mel": {
+                "n_mels": mcfg.n_mels,
+                "n_fft": mcfg.n_fft,
+                "hop_length": mcfg.hop_length,
+            },
             "tok_sha": hashlib.sha1(tok_repr.encode("utf-8")).hexdigest(),
         },
         sort_keys=True,
@@ -121,19 +119,24 @@ def _preprocess_cache_dir(cfg: DataConfig, key: str) -> Path | None:
 
 def preprocess_dataset(
     ds: DatasetDict,
-    feature_extractor: Wav2Vec2FeatureExtractor,
+    mcfg: ModelConfig,
     tokenizer: PreTrainedTokenizerFast,
     cfg: DataConfig,
 ) -> DatasetDict:
-    """Filter by duration, extract audio features, tokenize labels.
+    """Filter by duration, compute log-Mel features, tokenize labels.
 
     The finished DatasetDict is saved to ``<cache_dir>/preprocessed/<key>``
     and reloaded on subsequent runs — HF's auto-fingerprint cache is unreliable
-    here because the ``feature_extractor`` / ``tokenizer`` closures don't hash
-    deterministically across processes.
+    here because the ``tokenizer`` closure doesn't hash deterministically
+    across processes.
+
+    Output columns per example:
+      - ``input_features``: list[list[float]] of shape (T_mel, n_mels)
+      - ``input_length``:   int = T_mel (used by ``group_by_length``)
+      - ``labels``:         list[int] of token ids
     """
 
-    key = _preprocess_cache_key(feature_extractor, tokenizer, cfg)
+    key = _preprocess_cache_key(mcfg, tokenizer, cfg)
     save_dir = _preprocess_cache_dir(cfg, key)
 
     if save_dir is not None and save_dir.exists():
@@ -142,6 +145,9 @@ def preprocess_dataset(
 
     sr = cfg.sampling_rate
     max_len = int(cfg.max_audio_seconds * sr)
+    n_mels = mcfg.n_mels
+    n_fft = mcfg.n_fft
+    hop_length = mcfg.hop_length
 
     def is_valid_length(example):
         return len(example["audio"]["array"]) <= max_len
@@ -151,13 +157,16 @@ def preprocess_dataset(
 
     def prepare(batch):
         audio = batch["audio"]
-        inputs = feature_extractor(
-            audio["array"],
+        wav = np.asarray(audio["array"], dtype=np.float32)
+        mel = log_mel_spectrogram(
+            wav,
+            n_mels=n_mels,
+            n_fft=n_fft,
+            hop_length=hop_length,
             sampling_rate=sr,
-            return_tensors=None,
-        )
-        batch["input_values"] = inputs["input_values"][0]
-        batch["input_length"] = len(batch["input_values"])
+        )  # (T_mel, n_mels) torch.float32
+        batch["input_features"] = mel.numpy().tolist()
+        batch["input_length"] = int(mel.shape[0])
         text = normalize_text(batch["text"])
         batch["labels"] = tokenizer(text).input_ids
         return batch
@@ -187,35 +196,46 @@ def preprocess_dataset(
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
-    """Pads audio inputs and tokenized labels for ``SpeechEncoderDecoderModel``.
+    """Pads log-Mel features and tokenized labels for ``SpeechEncoderDecoderModel``.
 
-    Audio is padded via ``Wav2Vec2FeatureExtractor`` (float tensor + attention mask).
-    Labels are right-padded with -100 so CE loss ignores pad positions. The BOS that
-    the decoder expects as its first token is added by the model's
-    ``shift_tokens_right`` using ``decoder_start_token_id`` — so we strip the leading
-    BOS from labels to avoid duplicating it.
+    Each input example carries ``input_features`` of shape ``(T_i, n_mels)``.
+    We stack into a ``(B, T_max, n_mels)`` float tensor, zero-pad shorter
+    sequences along the time axis, and build an ``attention_mask`` of shape
+    ``(B, T_max)`` where 1 marks valid frames. Labels are right-padded with
+    -100 so CE loss ignores pad positions.
+
+    The BOS that the decoder expects as its first token is added by the model's
+    ``shift_tokens_right`` using ``decoder_start_token_id`` — so we strip the
+    leading BOS from labels to avoid duplicating it.
 
     We also precompute ``decoder_input_ids`` here. ``Seq2SeqTrainer.compute_loss``
-    pops ``labels`` from inputs before calling the model when a label smoother is
-    active (``label_smoothing_factor > 0``); without ``labels``,
+    pops ``labels`` from inputs before calling the model when a label smoother
+    is active (``label_smoothing_factor > 0``); without ``labels``,
     ``SpeechEncoderDecoderModel.forward`` won't derive ``decoder_input_ids``
     itself, and the decoder then gets called with both ids/embeds unset — which
     BartDecoder rejects. Providing ``decoder_input_ids`` in the batch avoids that.
     """
 
-    feature_extractor: Wav2Vec2FeatureExtractor
     tokenizer: PreTrainedTokenizerFast
     decoder_start_token_id: int
+    n_mels: int
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        audio_features = [
-            {"input_values": f["input_values"]} for f in features
-        ]
-        batch = self.feature_extractor.pad(
-            audio_features,
-            padding=True,
-            return_tensors="pt",
-        )
+        batch: dict[str, torch.Tensor] = {}
+
+        # (T_i, n_mels) per example → stack into (B, T_max, n_mels) with
+        # zero padding along the time axis + matching attention mask.
+        feats = [torch.as_tensor(f["input_features"], dtype=torch.float32) for f in features]
+        lengths = torch.tensor([t.shape[0] for t in feats], dtype=torch.long)
+        t_max = int(lengths.max().item())
+        bsz = len(feats)
+        padded = torch.zeros((bsz, t_max, self.n_mels), dtype=torch.float32)
+        attn = torch.zeros((bsz, t_max), dtype=torch.long)
+        for i, t in enumerate(feats):
+            padded[i, : t.shape[0]] = t
+            attn[i, : t.shape[0]] = 1
+        batch["input_features"] = padded
+        batch["attention_mask"] = attn
 
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.tokenizer.pad(

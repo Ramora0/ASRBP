@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from transformers import (
@@ -10,10 +12,12 @@ from transformers import (
     PreTrainedTokenizerFast,
     SpeechEncoderDecoderModel,
     Wav2Vec2ConformerConfig,
-    Wav2Vec2ConformerModel,
 )
-from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithCrossAttentions
+from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices
 from transformers.models.wav2vec2_conformer.modeling_wav2vec2_conformer import (
+    Wav2Vec2ConformerEncoder,
+    Wav2Vec2ConformerPreTrainedModel,
     Wav2Vec2ConformerSelfAttention,
 )
 
@@ -72,6 +76,164 @@ def _sdpa_self_attn_forward(
 
 
 Wav2Vec2ConformerSelfAttention.forward = _sdpa_self_attn_forward
+
+
+class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
+    """Log-Mel + Conv2d-subsampling frontend feeding ``Wav2Vec2ConformerEncoder``.
+
+    Replaces ``Wav2Vec2ConformerModel``'s raw-waveform CNN feature encoder +
+    feature projection. Input is a ``(B, T_mel, n_mels)`` log-Mel spectrogram
+    (see ``conformer_asr/features.py``). The stem is the standard ASR pattern
+    used by ESPnet/SpeechBrain/NeMo/Whisper: two ``Conv2d(k=3, s=2, pad=0)``
+    + ReLU → flatten → linear → dropout, giving ≈4× time downsampling. Then
+    the existing Conformer blocks run on top.
+
+    Slots into ``SpeechEncoderDecoderModel`` by exposing:
+      - ``.config.hidden_size`` (inherited from ``Wav2Vec2ConformerConfig``)
+      - ``forward(input_features, attention_mask=None, ...)`` returning a
+        ``BaseModelOutput`` (wrapper reads ``encoder_outputs[0]``).
+      - ``_get_feature_vector_attention_mask(feat_len, attention_mask, ...)``
+        which downsamples a ``(B, T_mel)`` mask by the Conv2d time arithmetic.
+    """
+
+    def __init__(self, config: Wav2Vec2ConformerConfig):
+        super().__init__(config)
+        self.n_mels = int(config.n_mels)
+        hidden = config.hidden_size
+
+        self.subsample = nn.Sequential(
+            nn.Conv2d(1, hidden, kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(hidden, hidden, kernel_size=3, stride=2),
+            nn.ReLU(),
+        )
+        # After two k=3 s=2 convs with no padding along the mel axis,
+        # out_dim = ((n_mels - 1) // 2 - 1) // 2.
+        mel_after = ((self.n_mels - 1) // 2 - 1) // 2
+        if mel_after <= 0:
+            raise ValueError(
+                f"n_mels={self.n_mels} too small for two Conv2d(k=3,s=2) layers"
+            )
+        self.proj = nn.Linear(hidden * mel_after, hidden)
+        self.dropout = nn.Dropout(config.hidden_dropout)
+
+        # Learnable mask embedding for SpecAugment-style time masking
+        # (mirrors ``Wav2Vec2ConformerModel.masked_spec_embed``).
+        self.masked_spec_embed = nn.Parameter(torch.zeros(hidden).uniform_())
+
+        self.encoder = Wav2Vec2ConformerEncoder(config)
+
+        self.post_init()
+
+    def _stem_output_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
+        """Per-sample valid output length after two Conv2d(k=3,s=2) along time.
+        ``l -> (l - 1) // 2 -> ((l - 1) // 2 - 1) // 2``. Clamped at 0 so
+        pathologically short inputs don't underflow to -1.
+        """
+        lengths = input_lengths
+        for _ in range(2):
+            lengths = torch.clamp((lengths - 1) // 2, min=0)
+        return lengths
+
+    def _get_feature_vector_attention_mask(
+        self,
+        feature_vector_length: int,
+        attention_mask: torch.LongTensor,
+        add_adapter=None,
+    ) -> torch.BoolTensor:
+        """Build a ``(B, feature_vector_length)`` **bool** mask from the
+        pre-stem ``(B, T_mel)`` mask using the Conv2d time arithmetic.
+
+        Bool dtype matches what the parent ``Wav2Vec2ConformerPreTrainedModel``
+        returns — ``Wav2Vec2ConformerEncoder.forward`` does ``~attention_mask``
+        which only gives the right (logical-NOT) answer on a bool tensor; on a
+        long tensor ``~1`` is ``-2`` which is either an out-of-bounds or
+        silently-wrapping negative index. ``add_adapter`` is accepted for
+        interface compatibility and ignored.
+        """
+        input_lengths = attention_mask.sum(-1)
+        output_lengths = self._stem_output_lengths(input_lengths)
+        arange = torch.arange(feature_vector_length, device=attention_mask.device)
+        return arange[None, :] < output_lengths[:, None]  # bool (B, feat_len)
+
+    def _mask_hidden_states(
+        self,
+        hidden_states: torch.FloatTensor,
+        attention_mask: torch.LongTensor | None = None,
+    ) -> torch.FloatTensor:
+        """SpecAugment-style masking on the post-stem hidden states, matching
+        ``Wav2Vec2ConformerModel._mask_hidden_states``."""
+        if not getattr(self.config, "apply_spec_augment", True):
+            return hidden_states
+        if not self.training:
+            return hidden_states
+
+        batch_size, sequence_length, hidden_size = hidden_states.size()
+
+        if self.config.mask_time_prob > 0:
+            mask_time_indices = _compute_mask_indices(
+                (batch_size, sequence_length),
+                mask_prob=self.config.mask_time_prob,
+                mask_length=self.config.mask_time_length,
+                attention_mask=attention_mask,
+                min_masks=self.config.mask_time_min_masks,
+            )
+            mask_time_indices = torch.tensor(
+                mask_time_indices, device=hidden_states.device, dtype=torch.bool
+            )
+            hidden_states[mask_time_indices] = self.masked_spec_embed.to(hidden_states.dtype)
+
+        if self.config.mask_feature_prob > 0:
+            mask_feature_indices = _compute_mask_indices(
+                (batch_size, hidden_size),
+                mask_prob=self.config.mask_feature_prob,
+                mask_length=self.config.mask_feature_length,
+                min_masks=self.config.mask_feature_min_masks,
+            )
+            mask_feature_indices = torch.tensor(
+                mask_feature_indices, device=hidden_states.device, dtype=torch.bool
+            )
+            mask_feature_indices = mask_feature_indices[:, None, :].expand(-1, sequence_length, -1)
+            hidden_states[mask_feature_indices] = 0
+
+        return hidden_states
+
+    def forward(
+        self,
+        input_features: torch.FloatTensor,
+        attention_mask: torch.LongTensor | None = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        return_dict: bool | None = None,
+        **kwargs,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # (B, T, n_mels) -> (B, 1, T, n_mels) -> subsample -> (B, H, T', M')
+        x = input_features.unsqueeze(1)
+        x = self.subsample(x)
+        bsz, hidden, t_out, m_out = x.shape
+        # (B, H, T', M') -> (B, T', H * M') -> (B, T', hidden)
+        x = x.permute(0, 2, 1, 3).reshape(bsz, t_out, hidden * m_out)
+        x = self.proj(x)
+        x = self.dropout(x)
+
+        # Downsample the pre-stem attention mask so the Conformer blocks see
+        # the correct (B, T') mask for self-attention and SpecAugment only masks
+        # over valid positions.
+        encoder_attention_mask = None
+        if attention_mask is not None:
+            encoder_attention_mask = self._get_feature_vector_attention_mask(t_out, attention_mask)
+
+        x = self._mask_hidden_states(x, attention_mask=encoder_attention_mask)
+
+        return self.encoder(
+            x,
+            attention_mask=encoder_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
 
 
 class _CompatBartForCausalLM(BartForCausalLM):
@@ -160,7 +322,7 @@ class _CompatBartForCausalLM(BartForCausalLM):
 
 
 def _build_encoder_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
-    return Wav2Vec2ConformerConfig(
+    cfg = Wav2Vec2ConformerConfig(
         hidden_size=mcfg.encoder_hidden_size,
         num_hidden_layers=mcfg.encoder_num_hidden_layers,
         num_attention_heads=mcfg.encoder_num_attention_heads,
@@ -176,6 +338,10 @@ def _build_encoder_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
         layerdrop=0.0,
         apply_spec_augment=True,
     )
+    # Stashed on the config so save_pretrained / from_pretrained preserve it —
+    # MelConformerEncoder reads n_mels out of config at construction time.
+    cfg.n_mels = mcfg.n_mels
+    return cfg
 
 
 def _build_decoder_config(mcfg: ModelConfig, vocab_size: int, pad_id: int, bos_id: int, eos_id: int) -> BartConfig:
@@ -217,7 +383,7 @@ def build_model(mcfg: ModelConfig, tokenizer: PreTrainedTokenizerFast) -> Speech
     enc_cfg = _build_encoder_config(mcfg)
     dec_cfg = _build_decoder_config(mcfg, len(tokenizer), pad_id, bos_id, eos_id)
 
-    encoder = Wav2Vec2ConformerModel(enc_cfg)
+    encoder = MelConformerEncoder(enc_cfg)
     decoder = _CompatBartForCausalLM(dec_cfg)
     model = SpeechEncoderDecoderModel(encoder=encoder, decoder=decoder)
 

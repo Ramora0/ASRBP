@@ -28,7 +28,6 @@ from conformer_asr.data import setup_cache_dir  # noqa: E402
 from conformer_asr.features import log_mel_spectrogram  # noqa: E402
 from conformer_asr.model import build_model  # noqa: E402
 from conformer_asr.tokenizer import load_tokenizer, normalize_text  # noqa: E402
-from conformer_asr.wandb_utils import init_wandb  # noqa: E402
 
 
 def _rank() -> int:
@@ -135,9 +134,6 @@ def parse_args() -> argparse.Namespace:
         help="Weight on CTC sequence log-prob (length-normalized) in n-best rescoring. "
              "0 disables. Matches the training ctc_weight by default (ESPnet convention).",
     )
-    p.add_argument("--no_wandb", action="store_true")
-    p.add_argument("--wandb_run_name", dest="run_name", default=None)
-    p.add_argument("--wandb_tags", dest="tags", default=None, help="comma-separated")
     return p.parse_args()
 
 
@@ -162,15 +158,6 @@ def main() -> None:
         if not dist.is_initialized():
             # NCCL for GPU collectives. `torchrun` sets MASTER_ADDR/PORT automatically.
             dist.init_process_group(backend="nccl")
-
-    if args.run_name:
-        cfg.wandb.run_name = args.run_name
-    if args.tags:
-        cfg.wandb.tags = [t.strip() for t in args.tags.split(",") if t.strip()]
-    # Evaluation runs get tagged so they're easy to filter in the wandb UI.
-    cfg.wandb.tags = list(cfg.wandb.tags) + [f"eval:{args.split}"]
-    if args.no_wandb:
-        cfg.wandb.enabled = False
 
     tokenizer_dir = args.tokenizer_dir or cfg.data.tokenizer_dir
     tokenizer = load_tokenizer(tokenizer_dir, cache_dir=cfg.data.cache_dir)
@@ -233,30 +220,6 @@ def main() -> None:
     if distributed:
         ds = ds.shard(num_shards=world_size, index=rank, contiguous=True)
         print(f"[rank {rank}/{world_size}] shard size: {len(ds)} (total: {full_len})")
-
-    # Force wandb on for evaluate.py even if the training config disabled it,
-    # as long as the user didn't pass --no_wandb. Init BEFORE inference so any
-    # generation errors are still captured by the run. Rank-0 only under DDP so
-    # we get one wandb run per evaluation, δεν one per GPU.
-    force_report = "wandb" if (cfg.wandb.enabled and not args.no_wandb) else "none"
-    cfg.train.report_to = force_report
-    wandb_run = init_wandb(
-        cfg,
-        extra_config={
-            "checkpoint": args.checkpoint,
-            "avg_checkpoints": args.avg_checkpoints,
-            "split": args.split,
-            "num_beams": args.num_beams,
-            "batch_size": args.batch_size,
-            "max_samples": args.max_samples or len(ds),
-            "lm_weight": args.lm_weight,
-            "ctc_weight": args.ctc_weight,
-            "len_penalty": args.len_penalty,
-            "lm_repo": args.lm_repo if args.lm_weight > 0 else None,
-            "world_size": world_size,
-        },
-        job_type="eval",
-    ) if is_main else None
 
     ctc_rescore = args.ctc_weight > 0.0
     if ctc_rescore and not hasattr(model, "ctc_head"):
@@ -493,23 +456,6 @@ def main() -> None:
     for i in range(n_show):
         print(f"  REF: {refs_all[i]}")
         print(f"  HYP: {preds_all[i]}\n")
-
-    if wandb_run is not None:
-        import wandb
-
-        key = f"final_wer/{args.split}"
-        wandb_run.summary[key] = float(score)
-        wandb_run.summary["num_beams"] = args.num_beams
-        wandb_run.summary["num_samples"] = len(preds_all)
-        wandb.log({key: float(score)})
-
-        if cfg.wandb.log_preds_table:
-            n = min(cfg.wandb.log_preds_n, len(preds_all))
-            table = wandb.Table(columns=["reference", "prediction"])
-            for ref, pred in zip(refs_all[:n], preds_all[:n]):
-                table.add_data(ref, pred)
-            wandb.log({f"eval/{args.split}/predictions": table})
-        wandb.finish()
 
     if distributed:
         import torch.distributed as dist

@@ -18,8 +18,10 @@ print(f"HF cache_dir (bootstrapped): {_resolved_cache}")
 from transformers import (  # noqa: E402
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    TrainerCallback,
     Wav2Vec2FeatureExtractor,
 )
+from transformers.trainer_callback import ProgressCallback  # noqa: E402
 
 from conformer_asr.config import load_config, resolve_precision  # noqa: E402
 from conformer_asr.data import (  # noqa: E402
@@ -37,6 +39,84 @@ from conformer_asr.wandb_utils import (  # noqa: E402
     init_wandb,
     wandb_is_enabled,
 )
+
+
+class DualProgressCallback(TrainerCallback):
+    """Two tqdm bars: overall training progress + current epoch.
+
+    Replaces HF's default ``ProgressCallback`` (remove that one before adding
+    this, or you get three bars). Also forwards HF's log dict through
+    ``tqdm.write`` so per-logging-step loss lines don't shred the bars.
+    """
+
+    def __init__(self) -> None:
+        self.overall_bar = None
+        self.epoch_bar = None
+        self._last_global_step = 0
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        from tqdm.auto import tqdm
+
+        self.overall_bar = tqdm(
+            total=state.max_steps,
+            desc="train",
+            position=0,
+            leave=True,
+            dynamic_ncols=True,
+            unit="step",
+        )
+        self._last_global_step = state.global_step  # nonzero on resume
+        self.overall_bar.update(state.global_step)
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        from tqdm.auto import tqdm
+
+        if self.epoch_bar is not None:
+            self.epoch_bar.close()
+        total_epochs = max(1, int(args.num_train_epochs))
+        steps_per_epoch = max(1, state.max_steps // total_epochs)
+        epoch_idx = (int(state.epoch) if state.epoch is not None else 0) + 1
+        self.epoch_bar = tqdm(
+            total=steps_per_epoch,
+            desc=f"epoch {epoch_idx}/{total_epochs}",
+            position=1,
+            leave=False,
+            dynamic_ncols=True,
+            unit="step",
+        )
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        delta = state.global_step - self._last_global_step
+        self._last_global_step = state.global_step
+        if self.overall_bar is not None:
+            self.overall_bar.update(delta)
+        if self.epoch_bar is not None:
+            self.epoch_bar.update(delta)
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if self.epoch_bar is not None:
+            self.epoch_bar.close()
+            self.epoch_bar = None
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.epoch_bar is not None:
+            self.epoch_bar.close()
+            self.epoch_bar = None
+        if self.overall_bar is not None:
+            self.overall_bar.close()
+            self.overall_bar = None
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None or self.overall_bar is None:
+            return
+        shown = {k: v for k, v in logs.items() if k != "total_flos"}
+        self.overall_bar.write(str(shown))
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,6 +252,8 @@ def main() -> None:
         greater_is_better=False,
         dataloader_num_workers=cfg.train.dataloader_num_workers,
         remove_unused_columns=False,
+        group_by_length=cfg.train.group_by_length,
+        length_column_name="input_length",
     )
 
     callbacks = []
@@ -197,6 +279,9 @@ def main() -> None:
         processing_class=feature_extractor,
         callbacks=callbacks or None,
     )
+    # Swap HF's single-bar ProgressCallback for our two-bar overall+epoch view.
+    trainer.remove_callback(ProgressCallback)
+    trainer.add_callback(DualProgressCallback())
     # SpeechEncoderDecoderModel.forward accepts **kwargs, which Trainer reads
     # as "model accepts num_items_in_batch" and injects the kwarg into inputs.
     # SED then forwards it to BartForCausalLM.forward, which doesn't accept it.

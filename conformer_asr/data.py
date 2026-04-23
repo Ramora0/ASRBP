@@ -155,21 +155,32 @@ def preprocess_dataset(
     # Only filter training clips by max length — we still want to score all eval audio.
     ds["train"] = ds["train"].filter(is_valid_length, num_proc=cfg.num_proc)
 
-    def prepare(batch):
-        audio = batch["audio"]
-        wav = np.asarray(audio["array"], dtype=np.float32)
-        mel = log_mel_spectrogram(
-            wav,
-            n_mels=n_mels,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            sampling_rate=sr,
-        )  # (T_mel, n_mels) torch.float32
-        batch["input_features"] = mel.numpy().tolist()
-        batch["input_length"] = int(mel.shape[0])
-        text = normalize_text(batch["text"])
-        batch["labels"] = tokenizer(text).input_ids
-        return batch
+    def prepare_batched(batch):
+        audios = batch["audio"]
+        texts = batch["text"]
+        mels: list[np.ndarray] = []
+        lengths: list[int] = []
+        labels: list[list[int]] = []
+        for audio, text in zip(audios, texts):
+            wav = np.asarray(audio["array"], dtype=np.float32)
+            mel = log_mel_spectrogram(
+                wav,
+                n_mels=n_mels,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                sampling_rate=sr,
+            )  # (T_mel, n_mels) torch.float32
+            # .numpy() is a zero-copy view; we skip .tolist() because materializing
+            # a nested Python list of ~160K floats per 20 s clip dominates walltime
+            # at 960 h scale. Arrow serializes the numpy array directly.
+            mels.append(mel.numpy())
+            lengths.append(int(mel.shape[0]))
+            labels.append(tokenizer(normalize_text(text)).input_ids)
+        return {
+            "input_features": mels,
+            "input_length": lengths,
+            "labels": labels,
+        }
 
     remove_cols = {
         split: [c for c in ds[split].column_names if c not in {"input_length"}]
@@ -177,7 +188,9 @@ def preprocess_dataset(
     }
     for split in ds:
         ds[split] = ds[split].map(
-            prepare,
+            prepare_batched,
+            batched=True,
+            batch_size=64,
             remove_columns=remove_cols[split],
             num_proc=cfg.num_proc,
             desc=f"preprocess {split}",

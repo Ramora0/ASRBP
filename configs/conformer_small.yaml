@@ -30,7 +30,7 @@ data:
   test_split: test.clean
   sampling_rate: 16000
   max_audio_seconds: 20.0
-  num_proc: 4
+  num_proc: 8
   tokenizer_dir: tokenizer
   cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache   # HF datasets + transformers cache
 

@@ -38,6 +38,16 @@ def build_mel_filters(n_mels: int, n_fft: int, sampling_rate: int) -> np.ndarray
     return filters.T
 
 
+@lru_cache(maxsize=4)
+def _cached_window(n_fft: int) -> torch.Tensor:
+    return torch.hann_window(n_fft)
+
+
+@lru_cache(maxsize=4)
+def _cached_filters_tensor(n_mels: int, n_fft: int, sampling_rate: int) -> torch.Tensor:
+    return torch.as_tensor(build_mel_filters(n_mels, n_fft, sampling_rate), dtype=torch.float32)
+
+
 def log_mel_spectrogram(
     waveform: np.ndarray | torch.Tensor,
     *,
@@ -51,6 +61,10 @@ def log_mel_spectrogram(
     Input can be a 1-D numpy array or torch tensor. Output frame count is
     ``T_wave // hop_length`` (we drop the trailing STFT frame, matching
     Whisper's convention) so 1 s of audio at 16 kHz / hop 160 yields 100 frames.
+
+    The Hann window and mel filter bank are cached per ``(n_fft,)`` / ``(n_mels,
+    n_fft, sampling_rate)`` so the offline preprocess loop doesn't reallocate
+    them on every clip.
     """
     if isinstance(waveform, np.ndarray):
         wav = torch.from_numpy(waveform).float()
@@ -59,7 +73,7 @@ def log_mel_spectrogram(
     if wav.dim() != 1:
         wav = wav.reshape(-1)
 
-    window = torch.hann_window(n_fft, device=wav.device)
+    window = _cached_window(n_fft)
     stft = torch.stft(
         wav,
         n_fft=n_fft,
@@ -72,8 +86,7 @@ def log_mel_spectrogram(
     # Drop the last frame so T_mel = T_wave // hop_length exactly.
     magnitudes = stft[..., :-1].abs().pow(2)  # (n_freq, T_mel)
 
-    filters = build_mel_filters(n_mels, n_fft, sampling_rate)
-    filters_t = torch.as_tensor(filters, dtype=magnitudes.dtype, device=magnitudes.device)
+    filters_t = _cached_filters_tensor(n_mels, n_fft, sampling_rate)
     mel_spec = filters_t @ magnitudes  # (n_mels, T_mel)
     log_mel = torch.clamp(mel_spec, min=1e-10).log()
 

@@ -1,1 +1,1 @@
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=4 scripts/train.py --config configs/conformer_small.yaml
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=4 scripts/train.py --config configs/conformer_small.yaml --early_eval_frac 0.05

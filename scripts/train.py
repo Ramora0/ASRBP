@@ -38,7 +38,7 @@ from transformers import (  # noqa: E402
 )
 from transformers.trainer_callback import ProgressCallback  # noqa: E402
 
-from conformer_asr.config import load_config, resolve_precision  # noqa: E402
+from conformer_asr.config import autocast_dtype, load_config, resolve_precision  # noqa: E402
 from conformer_asr.data import (  # noqa: E402
     DataCollatorSpeechSeq2SeqWithPadding,
     _preprocess_cache_dir,
@@ -51,6 +51,7 @@ from conformer_asr.metrics import build_compute_metrics  # noqa: E402
 from conformer_asr.model import build_model  # noqa: E402
 from conformer_asr.tokenizer import load_tokenizer  # noqa: E402
 from conformer_asr.wandb_utils import (  # noqa: E402
+    CTCEvalCallback,
     EpochLoggerCallback,
     PredictionsTableCallback,
     init_wandb,
@@ -167,6 +168,77 @@ class DualProgressCallback(TrainerCallback):
         self.overall_bar.write(str(shown))
 
 
+class OneShotEvalCallback(TrainerCallback):
+    """Fire eval exactly once at a given ``global_step``.
+
+    Useful for sanity-checking the full eval pipeline (generate → gather →
+    metrics → WER) well before the first real epoch-boundary eval would fire.
+    Sets ``control.should_evaluate = True`` on the target step, then stays
+    dormant so the normal epoch-boundary eval cadence is unaffected.
+    """
+
+    def __init__(self, target_step: int) -> None:
+        self.target_step = int(target_step)
+        self._fired = False
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self._fired and state.global_step >= self.target_step:
+            control.should_evaluate = True
+            self._fired = True
+        return control
+
+
+class HybridSeq2SeqTrainer(Seq2SeqTrainer):
+    """``Seq2SeqTrainer`` that keeps labels in the forward pass so the model
+    can compute both AED and CTC losses in one shot.
+
+    The stock ``Trainer.compute_loss`` pops ``labels`` from the batch before
+    calling the model whenever a ``label_smoother`` is active — that would
+    starve the CTC branch of its targets. We override to:
+      1. Leave labels in ``inputs`` so ``ConformerAEDWithCTC`` can compute the
+         raw CTC loss internally.
+      2. Re-apply label smoothing to *just* the AED branch on the way out
+         (the model's own AED loss is unsmoothed) and re-blend with the raw
+         CTC loss using the model's ``ctc_weight``.
+
+    A model without a CTC head falls back to the normal AED-only path so this
+    trainer is safe to use regardless of ``ctc_enabled``.
+    """
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch=None,
+    ):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+
+        ctc_loss = getattr(outputs, "ctc_loss", None)
+        aed_raw_loss = getattr(outputs, "aed_loss", None)
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        ctc_weight = float(getattr(unwrapped, "ctc_weight", 0.0))
+
+        if self.label_smoother is not None and labels is not None:
+            # Label smoother operates on ``outputs.logits`` (AED decoder logits)
+            # — it doesn't touch the CTC branch, which stays at raw CE.
+            aed_loss = self.label_smoother(outputs, labels, shift_labels=False)
+        else:
+            # No smoothing: reuse the model's own raw AED loss if available,
+            # otherwise fall back to ``outputs.loss`` (AED-only models).
+            aed_loss = aed_raw_loss if aed_raw_loss is not None else outputs.loss
+
+        if ctc_loss is not None and ctc_weight > 0.0:
+            loss = (1.0 - ctc_weight) * aed_loss + ctc_weight * ctc_loss
+        else:
+            loss = aed_loss
+
+        return (loss, outputs) if return_outputs else loss
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="configs/conformer_small.yaml")
@@ -190,11 +262,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb_notes", dest="notes")
     p.add_argument("--no_wandb", action="store_true", help="Disable wandb regardless of config")
     p.add_argument("--resume_from_checkpoint", default=None)
+    p.add_argument(
+        "--early_eval_frac",
+        type=float,
+        default=None,
+        help="Fraction of epoch 1 at which to fire a one-shot sanity-check eval (e.g. 0.05).",
+    )
     return p.parse_args()
 
 
 def _flatten_overrides(args: argparse.Namespace) -> dict:
-    overrides = {k: v for k, v in vars(args).items() if k not in {"config", "resume_from_checkpoint", "no_wandb"}}
+    overrides = {
+        k: v
+        for k, v in vars(args).items()
+        if k not in {"config", "resume_from_checkpoint", "no_wandb", "early_eval_frac"}
+    }
     # `tags` comes in as a comma-separated string
     tags = overrides.get("tags")
     if isinstance(tags, str):
@@ -328,8 +410,8 @@ def main() -> None:
     )
 
     # Order matters: EmptyCacheCallback must run AFTER PredictionsTableCallback
-    # (HF fires callbacks in list order), so we flush the allocator once both
-    # the main eval loop and the predictions-table generation pass are done.
+    # and CTCEvalCallback (HF fires callbacks in list order), so we flush the
+    # allocator once all eval passes (main, preds table, CTC) are done.
     callbacks = []
     if wandb_is_enabled(cfg):
         callbacks.append(EpochLoggerCallback())
@@ -342,9 +424,36 @@ def main() -> None:
                     n_samples=cfg.wandb.log_preds_n,
                 )
             )
+    if cfg.model.ctc_enabled:
+        callbacks.append(
+            CTCEvalCallback(
+                tokenizer=tokenizer,
+                eval_dataset=ds["validation"],
+                data_collator=collator,
+                batch_size=cfg.train.per_device_eval_batch_size,
+                autocast_dtype=autocast_dtype(cfg.train),
+            )
+        )
+    if args.early_eval_frac is not None and args.early_eval_frac > 0:
+        # Compute target step from effective batch size. World size and
+        # grad_accum both scale effective batch, so steps_per_epoch divides by
+        # the product. Clamp to >=1 so frac=0.001 on tiny subsets still fires.
+        eff_batch = (
+            cfg.train.per_device_train_batch_size
+            * max(1, _world_size())
+            * max(1, cfg.train.gradient_accumulation_steps)
+        )
+        steps_per_epoch = max(1, len(ds["train"]) // eff_batch)
+        target_step = max(1, int(steps_per_epoch * args.early_eval_frac))
+        print(
+            f"[early-eval] firing one-shot eval at step {target_step} "
+            f"({args.early_eval_frac:.1%} of epoch 1, ~{steps_per_epoch} steps/epoch)"
+        )
+        callbacks.append(OneShotEvalCallback(target_step=target_step))
     callbacks.append(EmptyCacheCallback())
 
-    trainer = Seq2SeqTrainer(
+    trainer_cls = HybridSeq2SeqTrainer if cfg.model.ctc_enabled else Seq2SeqTrainer
+    trainer = trainer_cls(
         model=model,
         args=training_args,
         train_dataset=ds["train"],

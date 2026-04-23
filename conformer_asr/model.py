@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -13,7 +15,11 @@ from transformers import (
     SpeechEncoderDecoderModel,
     Wav2Vec2ConformerConfig,
 )
-from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithCrossAttentions
+from transformers.modeling_outputs import (
+    BaseModelOutput,
+    CausalLMOutputWithCrossAttentions,
+    Seq2SeqLMOutput,
+)
 from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices
 from transformers.models.wav2vec2_conformer.modeling_wav2vec2_conformer import (
     Wav2Vec2ConformerEncoder,
@@ -321,6 +327,165 @@ class _CompatBartForCausalLM(BartForCausalLM):
         )
 
 
+@dataclass
+class ConformerAEDWithCTCOutput(Seq2SeqLMOutput):
+    """``Seq2SeqLMOutput`` extended with the CTC branch tensors.
+
+    ``loss`` is the blended AED+CTC total (what Trainer uses for backprop).
+    ``aed_loss`` / ``ctc_loss`` are the raw (unblended) components so a custom
+    ``compute_loss`` can re-apply label smoothing to only the AED branch and
+    then re-blend. ``ctc_logits`` + ``encoder_attention_mask`` are exposed so
+    downstream eval callbacks can greedy-decode without another encoder pass.
+    """
+
+    aed_loss: Optional[torch.FloatTensor] = None
+    ctc_loss: Optional[torch.FloatTensor] = None
+    ctc_logits: Optional[torch.FloatTensor] = None
+    encoder_attention_mask: Optional[torch.Tensor] = None
+
+
+class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
+    """Hybrid CTC/AED wrapper around ``SpeechEncoderDecoderModel``.
+
+    Adds a linear CTC head on top of the encoder's hidden states. When
+    ``labels`` are provided the total loss is
+    ``(1 - ctc_weight) * AED + ctc_weight * CTC``; otherwise behaves exactly
+    like the parent (so ``generate()`` is unaffected). The CTC head reuses
+    the tokenizer's existing ``<pad>`` id as the blank symbol — pad never
+    appears in real targets, so no vocab change is needed.
+    """
+
+    def __init__(
+        self,
+        config=None,
+        encoder=None,
+        decoder=None,
+        ctc_weight: float = 0.3,
+        ctc_blank_id: int = 0,
+    ):
+        super().__init__(config=config, encoder=encoder, decoder=decoder)
+        vocab_size = self.decoder.config.vocab_size
+        hidden_size = self.encoder.config.hidden_size
+        self.ctc_head = nn.Linear(hidden_size, vocab_size)
+        self.ctc_weight = float(ctc_weight)
+        self.ctc_blank_id = int(ctc_blank_id)
+        # Persist on the config so save_pretrained / from_pretrained round-trip
+        # the CTC knobs without needing a custom config class.
+        self.config.ctc_weight = self.ctc_weight
+        self.config.ctc_blank_id = self.ctc_blank_id
+
+    def _compute_ctc_loss(
+        self,
+        ctc_logits: torch.Tensor,
+        encoder_attn_mask: Optional[torch.Tensor],
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        # (B, T, V) -> (T, B, V) log-probs. Cast to fp32: CTC's log-sum-exp
+        # is unstable under fp16/bf16, and cuDNN's CTC kernel silently falls
+        # back to CPU if fed half-precision.
+        log_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1).float()
+
+        if encoder_attn_mask is not None:
+            input_lengths = encoder_attn_mask.sum(-1).long()
+        else:
+            input_lengths = torch.full(
+                (ctc_logits.size(0),),
+                ctc_logits.size(1),
+                dtype=torch.long,
+                device=ctc_logits.device,
+            )
+
+        # Drop -100 (pad-ignore) before handing targets to CTC; CTC treats the
+        # flat concatenation of all target sequences plus per-sample lengths.
+        label_mask = labels.ne(-100)
+        label_lengths = label_mask.sum(-1).long()
+        flat_targets = labels.masked_select(label_mask).long()
+
+        return F.ctc_loss(
+            log_probs,
+            flat_targets,
+            input_lengths,
+            label_lengths,
+            blank=self.ctc_blank_id,
+            reduction="mean",
+            zero_infinity=True,
+        )
+
+    def forward(
+        self,
+        input_features=None,
+        attention_mask=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        encoder_outputs=None,
+        labels=None,
+        return_dict=None,
+        **kwargs,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Run the encoder ourselves (when not already cached by ``generate``)
+        # so we can tap the hidden states for CTC without a second forward.
+        encoder_was_run_here = encoder_outputs is None
+        if encoder_was_run_here:
+            encoder_outputs = self.encoder(
+                input_features=input_features,
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+        encoder_hidden = encoder_outputs[0]
+
+        encoder_attn_mask = None
+        if attention_mask is not None:
+            encoder_attn_mask = self.encoder._get_feature_vector_attention_mask(
+                encoder_hidden.size(1), attention_mask
+            )
+
+        # AED path — delegate to the parent, reusing our encoder outputs.
+        aed_outputs = super().forward(
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            encoder_outputs=encoder_outputs,
+            labels=labels,
+            return_dict=True,
+            **kwargs,
+        )
+        aed_loss = aed_outputs.loss
+
+        # CTC head. Skip during ``generate``'s incremental decoder steps (when
+        # encoder_outputs was cached and no labels are requested) — the head
+        # would just produce unused logits step after step.
+        ctc_logits = None
+        ctc_loss = None
+        if encoder_was_run_here or labels is not None:
+            ctc_logits = self.ctc_head(encoder_hidden)
+            if labels is not None:
+                ctc_loss = self._compute_ctc_loss(ctc_logits, encoder_attn_mask, labels)
+
+        if aed_loss is not None and ctc_loss is not None:
+            total_loss = (1.0 - self.ctc_weight) * aed_loss + self.ctc_weight * ctc_loss
+        else:
+            total_loss = aed_loss
+
+        output = ConformerAEDWithCTCOutput(
+            loss=total_loss,
+            logits=aed_outputs.logits,
+            past_key_values=aed_outputs.past_key_values,
+            decoder_hidden_states=aed_outputs.decoder_hidden_states,
+            decoder_attentions=aed_outputs.decoder_attentions,
+            cross_attentions=aed_outputs.cross_attentions,
+            encoder_last_hidden_state=aed_outputs.encoder_last_hidden_state,
+            encoder_hidden_states=aed_outputs.encoder_hidden_states,
+            encoder_attentions=aed_outputs.encoder_attentions,
+            aed_loss=aed_loss,
+            ctc_loss=ctc_loss,
+            ctc_logits=ctc_logits,
+            encoder_attention_mask=encoder_attn_mask,
+        )
+        return output if return_dict else output.to_tuple()
+
+
 def _build_encoder_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
     cfg = Wav2Vec2ConformerConfig(
         hidden_size=mcfg.encoder_hidden_size,
@@ -385,7 +550,15 @@ def build_model(mcfg: ModelConfig, tokenizer: PreTrainedTokenizerFast) -> Speech
 
     encoder = MelConformerEncoder(enc_cfg)
     decoder = _CompatBartForCausalLM(dec_cfg)
-    model = SpeechEncoderDecoderModel(encoder=encoder, decoder=decoder)
+    if getattr(mcfg, "ctc_enabled", False):
+        model = ConformerAEDWithCTC(
+            encoder=encoder,
+            decoder=decoder,
+            ctc_weight=mcfg.ctc_weight,
+            ctc_blank_id=pad_id,
+        )
+    else:
+        model = SpeechEncoderDecoderModel(encoder=encoder, decoder=decoder)
 
     # Wire special tokens at the top-level config so generate() picks them up.
     model.config.pad_token_id = pad_id

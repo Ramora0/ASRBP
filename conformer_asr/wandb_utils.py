@@ -10,7 +10,7 @@ from typing import Any
 
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 
-from .config import Config, WandbConfig
+from .config import Config, WandbConfig, autocast_dtype
 
 
 def _parse_report_to(value: str | list[str] | None) -> list[str]:
@@ -238,3 +238,151 @@ class PredictionsTableCallback(TrainerCallback):
             if attention_mask is not None:
                 del attention_mask
             self._flush_cuda_cache()
+
+
+class CTCEvalCallback(TrainerCallback):
+    """Log CTC-only WER over the validation set at each eval step.
+
+    Runs an encoder-only forward pass (no autoregressive generate) per batch,
+    taps ``ctc_logits`` + ``encoder_attention_mask`` from the model output,
+    greedy-decodes, and reports ``eval/ctc_wer`` alongside the AED WER that
+    Seq2SeqTrainer already logs. Exists as a separate callback — rather than
+    being folded into ``compute_metrics`` — because the Trainer's eval loop
+    only surfaces ``generate()`` outputs, not encoder hidden states.
+
+    CTC WER is usually 2–5× higher than AED WER on from-scratch training, but
+    it's the right signal for diagnosing whether the *encoder* alignment is
+    learning: if AED WER drops while CTC WER stays flat, the decoder is
+    memorizing rather than being told where to listen.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        eval_dataset,
+        data_collator,
+        batch_size: int = 8,
+        autocast_dtype=None,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.eval_dataset = eval_dataset
+        self.data_collator = data_collator
+        self.batch_size = int(batch_size)
+        self.autocast_dtype = autocast_dtype
+        self._wandb = None
+
+    def _ensure_wandb(self):
+        if self._wandb is None:
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    self._wandb = wandb
+            except ImportError:
+                self._wandb = None
+        return self._wandb
+
+    @staticmethod
+    def _unwrap(model):
+        # DDP / accelerate wrap the model; reach the raw ``ConformerAEDWithCTC``
+        # so we can read ``ctc_blank_id`` and know the ``ctc_head`` is present.
+        while hasattr(model, "module"):
+            model = model.module
+        return model
+
+    def on_evaluate(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        metrics: dict[str, float] | None = None,
+        **kwargs,
+    ):
+        # Rank-0 only — mirrors ``PredictionsTableCallback`` and avoids
+        # cross-rank duplication of work.
+        if not state.is_world_process_zero:
+            return
+
+        model = kwargs.get("model")
+        if model is None:
+            return
+        unwrapped = self._unwrap(model)
+        if not hasattr(unwrapped, "ctc_head"):
+            return  # model built without CTC — nothing to report
+
+        import torch
+
+        from .metrics import compute_wer, ctc_greedy_decode
+
+        was_training = unwrapped.training
+        unwrapped.eval()
+        device = next(unwrapped.parameters()).device
+
+        preds_all: list[str] = []
+        refs_all: list[str] = []
+
+        use_autocast = (
+            device.type == "cuda"
+            and self.autocast_dtype is not None
+            and self.autocast_dtype != torch.float32
+        )
+
+        n = len(self.eval_dataset)
+        try:
+            with torch.no_grad():
+                for start in range(0, n, self.batch_size):
+                    end = min(start + self.batch_size, n)
+                    batch_feats = [self.eval_dataset[i] for i in range(start, end)]
+                    batch = self.data_collator(batch_feats)
+                    input_features = batch["input_features"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+                    labels = batch["labels"]
+
+                    autocast_ctx = (
+                        torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
+                        if use_autocast
+                        else torch.autocast(device_type="cpu", enabled=False)
+                    )
+                    with autocast_ctx:
+                        outputs = unwrapped(
+                            input_features=input_features,
+                            attention_mask=attention_mask,
+                            labels=None,
+                        )
+
+                    ctc_logits = outputs.ctc_logits
+                    enc_mask = outputs.encoder_attention_mask
+                    input_lengths = enc_mask.sum(-1).long() if enc_mask is not None else None
+
+                    pred_ids = ctc_greedy_decode(
+                        ctc_logits.float(),
+                        input_lengths=input_lengths,
+                        blank=unwrapped.ctc_blank_id,
+                    )
+                    preds = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+
+                    label_ids = labels.masked_fill(labels == -100, self.tokenizer.pad_token_id)
+                    refs = self.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+                    preds_all.extend(preds)
+                    refs_all.extend(refs)
+        finally:
+            if was_training:
+                unwrapped.train()
+
+        wer = compute_wer(preds_all, refs_all)
+
+        if metrics is not None:
+            metrics["eval/ctc_wer"] = float(wer)
+
+        wandb = self._ensure_wandb()
+        if wandb is not None:
+            wandb.log(
+                {
+                    "eval/ctc_wer": float(wer),
+                    "epoch": state.epoch,
+                    "train/global_step": state.global_step,
+                },
+                step=state.global_step,
+            )
+        print(f"[ctc-eval] step={state.global_step} epoch={state.epoch} ctc_wer={wer:.4f}")

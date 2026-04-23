@@ -27,6 +27,11 @@ model:
   decoder_ffn_dim: 1024
   decoder_dropout: 0.05
   decoder_max_position_embeddings: 448
+  # Hybrid CTC/AED. 0.3 CTC / 0.7 AED is the ESPnet/WeNet default and the
+  # sweet spot for from-scratch encoders — low enough that AED still dominates
+  # the decoder-side LM learning, high enough to force encoder alignment.
+  ctc_enabled: true
+  ctc_weight: 0.3
 
 data:
   dataset_id: openslr/librispeech_asr

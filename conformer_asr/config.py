@@ -31,6 +31,14 @@ class ModelConfig:
     decoder_ffn_dim: int
     decoder_dropout: float
     decoder_max_position_embeddings: int
+    # Hybrid CTC/AED auxiliary loss. When enabled, a linear CTC head is added
+    # on top of the encoder and the total training loss becomes
+    # ``(1 - ctc_weight) * AED + ctc_weight * CTC``. CTC imposes monotonic
+    # alignment in the encoder — the single biggest convergence lever for
+    # from-scratch AED — and also powers a cheap greedy-decode WER readout at
+    # eval time (``CTCEvalCallback`` in ``wandb_utils``).
+    ctc_enabled: bool
+    ctc_weight: float
 
 
 @dataclass

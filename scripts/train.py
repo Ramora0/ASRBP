@@ -197,6 +197,11 @@ def main() -> None:
         processing_class=feature_extractor,
         callbacks=callbacks or None,
     )
+    # SpeechEncoderDecoderModel.forward accepts **kwargs, which Trainer reads
+    # as "model accepts num_items_in_batch" and injects the kwarg into inputs.
+    # SED then forwards it to BartForCausalLM.forward, which doesn't accept it.
+    # Opt out of loss-kwarg forwarding — gradient accumulation still works.
+    trainer.model_accepts_loss_kwargs = False
 
     if wandb_run is not None and cfg.wandb.watch_model:
         import wandb

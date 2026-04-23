@@ -86,6 +86,15 @@ def _preprocess_cache_key(
         tok_repr = tokenizer.backend_tokenizer.to_str()
     except Exception:
         tok_repr = json.dumps(sorted(tokenizer.get_vocab().items()))
+
+    # Strip version-string fields that don't affect output but would otherwise
+    # invalidate the cache on every transformers upgrade/downgrade.
+    fe_dict = {
+        k: v
+        for k, v in feature_extractor.to_dict().items()
+        if k not in {"transformers_version", "_commit_hash", "_auto_class"}
+    }
+
     blob = json.dumps(
         {
             "v": 1,  # preprocessing-logic version; bump when prepare() changes
@@ -95,7 +104,7 @@ def _preprocess_cache_key(
             "test_split": cfg.test_split,
             "sampling_rate": cfg.sampling_rate,
             "max_audio_seconds": cfg.max_audio_seconds,
-            "fe": feature_extractor.to_dict(),
+            "fe": fe_dict,
             "tok_sha": hashlib.sha1(tok_repr.encode("utf-8")).hexdigest(),
         },
         sort_keys=True,

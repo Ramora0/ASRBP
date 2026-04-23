@@ -21,6 +21,7 @@ from transformers import Wav2Vec2ConformerConfig
 from ..config import ModelConfig
 from ..downsamplers import build_downsampler
 from .mel_conformer import MelConformerEncoder
+from .preproc import SpecAugment
 
 
 def _build_conformer_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
@@ -31,19 +32,34 @@ def _build_conformer_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
         intermediate_size=mcfg.encoder_intermediate_size,
         conv_depthwise_kernel_size=mcfg.encoder_conv_depthwise_kernel_size,
         position_embeddings_type="rotary",
-        mask_time_prob=mcfg.encoder_mask_time_prob,
-        mask_feature_prob=mcfg.encoder_mask_feature_prob,
         hidden_dropout=mcfg.encoder_hidden_dropout,
         attention_dropout=mcfg.encoder_attention_dropout,
         activation_dropout=mcfg.encoder_activation_dropout,
         feat_proj_dropout=0.0,
         layerdrop=mcfg.encoder_layerdrop,
-        apply_spec_augment=True,
+        # SpecAugment is done externally by the ``SpecAugment`` module on
+        # pre-stem log-Mel features (see encoders/preproc.py), so disable
+        # HF's post-stem ``_mask_hidden_states`` entirely to avoid double
+        # masking if a future refactor re-wires it.
+        apply_spec_augment=False,
+        mask_time_prob=0.0,
+        mask_feature_prob=0.0,
     )
     # Stashed on the config so save_pretrained / from_pretrained preserve it —
     # MelConformerEncoder reads n_mels out of config at construction time.
     cfg.n_mels = mcfg.n_mels
     return cfg
+
+
+def _build_spec_augment(mcfg: ModelConfig) -> SpecAugment:
+    return SpecAugment(
+        time_masks=mcfg.spec_aug_time_masks,
+        time_length_low=mcfg.spec_aug_time_length_low,
+        time_length_high=mcfg.spec_aug_time_length_high,
+        feature_masks=mcfg.spec_aug_feature_masks,
+        feature_length_low=mcfg.spec_aug_feature_length_low,
+        feature_length_high=mcfg.spec_aug_feature_length_high,
+    )
 
 
 def _build_mel_conformer(mcfg: ModelConfig) -> MelConformerEncoder:
@@ -54,7 +70,8 @@ def _build_mel_conformer(mcfg: ModelConfig) -> MelConformerEncoder:
         hidden=mcfg.encoder_hidden_size,
         dropout=mcfg.encoder_hidden_dropout,
     )
-    return MelConformerEncoder(enc_cfg, downsampler=downsampler)
+    spec_augment = _build_spec_augment(mcfg)
+    return MelConformerEncoder(enc_cfg, downsampler=downsampler, spec_augment=spec_augment)
 
 
 ENCODERS: dict[str, Callable[[ModelConfig], nn.Module]] = {

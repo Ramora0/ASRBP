@@ -257,6 +257,78 @@ class OneShotEvalCallback(TrainerCallback):
         return control
 
 
+def _unwrap_encoder(model):
+    """Peel DDP / SpeechEncoderDecoderModel wrappers down to ``MelConformerEncoder``."""
+    m = model
+    while hasattr(m, "module"):
+        m = m.module
+    return getattr(m, "encoder", None)
+
+
+class FreezeInputNormCallback(TrainerCallback):
+    """Freeze ``InputNormalization`` running stats at a configured epoch.
+
+    Mirrors SB's ``InputNormalization(update_until_epoch=N)``: stats
+    accumulate for the first N epochs of training (during which the encoder
+    is also learning a crude alignment), then are frozen for the rest of
+    training and all downstream eval. The frozen running_mean / running_var
+    buffers ride along in the model state_dict.
+    """
+
+    def __init__(self, freeze_after_epochs: int) -> None:
+        self.freeze_after = int(freeze_after_epochs)
+        self._done = False
+
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        if self._done or model is None:
+            return
+        if (state.epoch or 0.0) < self.freeze_after:
+            return
+        enc = _unwrap_encoder(model)
+        norm = getattr(enc, "input_norm", None) if enc is not None else None
+        if norm is not None and not norm.frozen:
+            norm.frozen = True
+            self._done = True
+            n_seen = int(norm.n_seen.item())
+            print(f"[input-norm] frozen at epoch {state.epoch:.2f} (n_seen={n_seen} frames)")
+
+
+class SpecAugWarmupCallback(TrainerCallback):
+    """Gate ``SpecAugment`` off until ``warmup_steps`` global steps have passed.
+
+    ``SpecAugment.active`` defaults to True; this callback flips it off at the
+    start of training and back on once ``state.global_step`` crosses the
+    threshold. ``warmup_steps <= 0`` skips the gating entirely (no-op).
+    """
+
+    def __init__(self, warmup_steps: int) -> None:
+        self.warmup = int(warmup_steps)
+        self._activated = False
+
+    def _set_active(self, model, active: bool) -> None:
+        enc = _unwrap_encoder(model)
+        aug = getattr(enc, "spec_augment", None) if enc is not None else None
+        if aug is not None:
+            aug.active = active
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.warmup <= 0 or model is None:
+            return
+        if state.global_step < self.warmup:
+            self._set_active(model, False)
+        else:
+            self._set_active(model, True)
+            self._activated = True
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if self._activated or self.warmup <= 0 or model is None:
+            return
+        if state.global_step >= self.warmup:
+            self._set_active(model, True)
+            self._activated = True
+            print(f"[spec-augment] activated at step {state.global_step}")
+
+
 class SpeedAugSeq2SeqTrainer(Seq2SeqTrainer):
     """``Seq2SeqTrainer`` variant that subsamples the speed-perturbed cache.
 
@@ -586,6 +658,9 @@ def main() -> None:
     # Must run AFTER EmptyCacheCallback has done its work but order here doesn't
     # matter; on_save only needs the saved directory to exist on disk.
     callbacks.append(EpochCheckpointRenameCallback())
+    callbacks.append(FreezeInputNormCallback(cfg.model.input_normalize_freeze_epochs))
+    if cfg.model.spec_aug_warmup_steps > 0:
+        callbacks.append(SpecAugWarmupCallback(cfg.model.spec_aug_warmup_steps))
     if cfg.train.swa_enabled:
         callbacks.append(
             SWACallback(

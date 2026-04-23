@@ -1,9 +1,15 @@
 """Log-Mel + pluggable-downsampler Conformer encoder.
 
 Takes a ``(B, T_mel, n_mels)`` log-Mel spectrogram (see
-``conformer_asr/features.py``), runs it through a swappable ``Downsampler``
-(defaults to the standard 2× ``Conv2d(k=3, s=2)`` stem), then the existing HF
-Conformer blocks.
+``conformer_asr/features.py``), runs it through:
+
+  1. ``InputNormalization`` — per-bin running mean/var, updated for the
+     first N epochs then frozen (see ``encoders/preproc.py``).
+  2. ``SpecAugment`` — pre-stem deterministic K time + K feature masks
+     with zero-fill (see ``encoders/preproc.py``). No-op outside training
+     or before ``spec_aug_warmup_steps``.
+  3. A swappable ``Downsampler`` (defaults to 2× ``Conv2d(k=3, s=2)``).
+  4. The existing HF ``Wav2Vec2ConformerEncoder`` blocks.
 
 Slots into ``SpeechEncoderDecoderModel`` by exposing:
   - ``.config.hidden_size`` (inherited from ``Wav2Vec2ConformerConfig``)
@@ -13,23 +19,22 @@ Slots into ``SpeechEncoderDecoderModel`` by exposing:
     which translates the pre-stem mask through the downsampler's time
     arithmetic so the transformer only attends to valid positions.
 
-The downsampler is external state — pass it into ``__init__`` (normally via
-``build_encoder`` which in turn calls ``build_downsampler``). The encoder
-intentionally does not know what *kind* of downsampler it has, just the
-``Downsampler`` interface.
+The downsampler and spec-augment modules are external state — pass them
+into ``__init__`` (normally via ``build_encoder``). The encoder doesn't
+care which concrete classes they are, just the interface contracts.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 from transformers import Wav2Vec2ConformerConfig
-from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices
 from transformers.models.wav2vec2_conformer.modeling_wav2vec2_conformer import (
     Wav2Vec2ConformerEncoder,
     Wav2Vec2ConformerPreTrainedModel,
 )
 
 from ..downsamplers.base import Downsampler
+from .preproc import InputNormalization, SpecAugment
 from .sdpa_patch import install_sdpa_attention_patch
 
 install_sdpa_attention_patch()
@@ -38,17 +43,18 @@ install_sdpa_attention_patch()
 class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
     """Mel-input Conformer encoder with a pluggable ``Downsampler`` stem."""
 
-    def __init__(self, config: Wav2Vec2ConformerConfig, downsampler: Downsampler):
+    def __init__(
+        self,
+        config: Wav2Vec2ConformerConfig,
+        downsampler: Downsampler,
+        spec_augment: SpecAugment,
+    ):
         super().__init__(config)
         self.n_mels = int(config.n_mels)
-        hidden = config.hidden_size
 
+        self.input_norm = InputNormalization(n_features=self.n_mels)
+        self.spec_augment = spec_augment
         self.downsampler = downsampler
-
-        # Learnable mask embedding for SpecAugment-style time masking
-        # (mirrors ``Wav2Vec2ConformerModel.masked_spec_embed``).
-        self.masked_spec_embed = nn.Parameter(torch.zeros(hidden).uniform_())
-
         self.encoder = Wav2Vec2ConformerEncoder(config)
 
         self.post_init()
@@ -74,48 +80,6 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         arange = torch.arange(feature_vector_length, device=attention_mask.device)
         return arange[None, :] < output_lengths[:, None]
 
-    def _mask_hidden_states(
-        self,
-        hidden_states: torch.FloatTensor,
-        attention_mask: torch.LongTensor | None = None,
-    ) -> torch.FloatTensor:
-        """SpecAugment-style masking on post-stem hidden states, matching
-        ``Wav2Vec2ConformerModel._mask_hidden_states``."""
-        if not getattr(self.config, "apply_spec_augment", True):
-            return hidden_states
-        if not self.training:
-            return hidden_states
-
-        batch_size, sequence_length, hidden_size = hidden_states.size()
-
-        if self.config.mask_time_prob > 0:
-            mask_time_indices = _compute_mask_indices(
-                (batch_size, sequence_length),
-                mask_prob=self.config.mask_time_prob,
-                mask_length=self.config.mask_time_length,
-                attention_mask=attention_mask,
-                min_masks=self.config.mask_time_min_masks,
-            )
-            mask_time_indices = torch.tensor(
-                mask_time_indices, device=hidden_states.device, dtype=torch.bool
-            )
-            hidden_states[mask_time_indices] = self.masked_spec_embed.to(hidden_states.dtype)
-
-        if self.config.mask_feature_prob > 0:
-            mask_feature_indices = _compute_mask_indices(
-                (batch_size, hidden_size),
-                mask_prob=self.config.mask_feature_prob,
-                mask_length=self.config.mask_feature_length,
-                min_masks=self.config.mask_feature_min_masks,
-            )
-            mask_feature_indices = torch.tensor(
-                mask_feature_indices, device=hidden_states.device, dtype=torch.bool
-            )
-            mask_feature_indices = mask_feature_indices[:, None, :].expand(-1, sequence_length, -1)
-            hidden_states[mask_feature_indices] = 0
-
-        return hidden_states
-
     def forward(
         self,
         input_features: torch.FloatTensor,
@@ -127,17 +91,21 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        x = self.downsampler(input_features)
+        # 1. Per-bin normalization (stats update during training until frozen).
+        # 2. Pre-stem SpecAugment (training only, zero-fill after normalization
+        #    so masked regions land on the per-bin mean).
+        x = self.input_norm(input_features, attention_mask=attention_mask)
+        x = self.spec_augment(x, attention_mask=attention_mask)
+
+        # 3. Downsampler stem: (B, T_mel, n_mels) → (B, T', hidden).
+        x = self.downsampler(x)
         t_out = x.shape[1]
 
         # Downsample the pre-stem attention mask so the Conformer blocks see
-        # the correct (B, T') mask for self-attention and SpecAugment only
-        # masks over valid positions.
+        # the correct (B, T') mask for self-attention.
         encoder_attention_mask = None
         if attention_mask is not None:
             encoder_attention_mask = self._get_feature_vector_attention_mask(t_out, attention_mask)
-
-        x = self._mask_hidden_states(x, attention_mask=encoder_attention_mask)
 
         return self.encoder(
             x,

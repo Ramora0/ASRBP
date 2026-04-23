@@ -34,8 +34,6 @@ class ModelConfig:
     encoder_num_attention_heads: int
     encoder_intermediate_size: int
     encoder_conv_depthwise_kernel_size: int
-    encoder_mask_time_prob: float
-    encoder_mask_feature_prob: float
     encoder_hidden_dropout: float
     encoder_attention_dropout: float
     encoder_activation_dropout: float
@@ -64,6 +62,27 @@ class ModelConfig:
     # eval time (``CTCEvalCallback`` in ``wandb_utils``).
     ctc_enabled: bool
     ctc_weight: float
+    # Per-bin log-Mel normalization — running mean/var updated during training
+    # until ``input_normalize_freeze_epochs`` have elapsed, then frozen for
+    # the rest of training and all downstream eval. Mirrors SB's
+    # ``InputNormalization(norm_type='global', update_until_epoch=N)``. The
+    # running_mean / running_var buffers are saved in the state dict so
+    # ``scripts/evaluate.py`` inherits the frozen stats via load_state_dict.
+    input_normalize_freeze_epochs: int
+    # SpecAugment applied **pre-stem** on (B, T_mel, n_mels), at the 100 Hz
+    # frame rate. Deterministic K masks per sample, lengths sampled uniformly
+    # from [low, high]. Zero-fill (after InputNormalization, zero == per-bin
+    # mean). Faithful to Park et al. 2019 and SB's LibriSpeech recipe.
+    spec_aug_time_masks: int
+    spec_aug_time_length_low: int
+    spec_aug_time_length_high: int
+    spec_aug_feature_masks: int
+    spec_aug_feature_length_low: int
+    spec_aug_feature_length_high: int
+    # Steps of pure supervised training before SpecAugment turns on. 0 = always
+    # on. SB conformer_large uses 8000 to let the model learn a crude alignment
+    # first; optional on short schedules.
+    spec_aug_warmup_steps: int
     # Spectrogram → transformer-input bridge. Nested so the downsampler family
     # can carry its own knobs without bloating the top-level ``ModelConfig``.
     downsampler: DownsamplerConfig = field(default_factory=DownsamplerConfig)

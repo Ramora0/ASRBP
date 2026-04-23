@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -628,11 +630,60 @@ def main() -> None:
     # tokenizer + artifact upload explicitly so non-zero ranks don't race on
     # the same output directory.
     trainer.save_model(str(final_dir))
-    if trainer.is_world_process_zero():
+    is_main = trainer.is_world_process_zero()
+    if is_main:
         tokenizer.save_pretrained(str(final_dir))
 
-    if wandb_run is not None and trainer.is_world_process_zero():
+    # Post-training evaluation. evaluate.py είναι intentionally wandb-free and
+    # single-process; we shell out from rank 0, strip torchrun's distributed env
+    # vars so the subprocess doesn't try to re-init NCCL, then push the final
+    # WER onto this run's wandb summary.
+    final_wer: float | None = None
+    if is_main:
+        # Free trainer-held GPU memory (model + AdamW state ≈ 3× model size)
+        # before the subprocess spins up a second model copy on the same GPU.
+        import gc
+
+        del trainer
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        eval_json = Path(cfg.train.output_dir) / "final_wer.json"
+        sub_env = os.environ.copy()
+        sub_env["WORLD_SIZE"] = "1"
+        sub_env["RANK"] = "0"
+        sub_env["LOCAL_RANK"] = "0"
+        for _k in ("MASTER_ADDR", "MASTER_PORT", "TORCHELASTIC_RUN_ID"):
+            sub_env.pop(_k, None)
+
+        cmd = [
+            sys.executable,
+            str(Path(__file__).parent / "evaluate.py"),
+            "--config", args.config,
+            "--checkpoint", str(final_dir),
+            "--split", cfg.data.test_split,
+            "--output_json", str(eval_json),
+        ]
+        print(f"[post-train-eval] {' '.join(cmd)}")
+        try:
+            subprocess.run(cmd, check=True, env=sub_env)
+            with open(eval_json) as fh:
+                results = json.load(fh)
+            final_wer = float(results[-1]["wer"])
+            print(f"[post-train-eval] final WER on {cfg.data.test_split}: {final_wer:.4f}")
+        except (subprocess.CalledProcessError, OSError, KeyError, ValueError) as exc:
+            # Don't crash training because eval failed — weights are already saved.
+            print(f"[post-train-eval] skipped: {exc}")
+
+    if wandb_run is not None and is_main:
         import wandb
+
+        if final_wer is not None:
+            key = f"final_wer/{cfg.data.test_split}"
+            wandb_run.summary[key] = final_wer
+            wandb.log({key: final_wer})
 
         # Save the final model as a wandb Artifact for easy downstream eval.
         artifact = wandb.Artifact(
@@ -642,6 +693,7 @@ def main() -> None:
                 "n_parameters": n_params,
                 "subset": cfg.data.subset,
                 "num_train_epochs": cfg.train.num_train_epochs,
+                "final_wer": final_wer,
             },
         )
         artifact.add_dir(str(final_dir))

@@ -1,1 +1,2 @@
 - KenLM + Normal LLM
+- Batch size + LR tuning

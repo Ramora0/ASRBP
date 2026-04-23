@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ print(f"HF cache_dir (bootstrapped): {_resolved_cache}")
 from conformer_asr.metrics import compute_wer  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 from datasets import Audio, load_dataset  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
@@ -27,6 +29,22 @@ from conformer_asr.features import log_mel_spectrogram  # noqa: E402
 from conformer_asr.model import build_model  # noqa: E402
 from conformer_asr.tokenizer import load_tokenizer, normalize_text  # noqa: E402
 from conformer_asr.wandb_utils import init_wandb  # noqa: E402
+
+
+def _rank() -> int:
+    return int(os.environ.get("RANK", "0"))
+
+
+def _world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def _local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", "0"))
+
+
+def _is_main() -> bool:
+    return _rank() == 0
 
 
 def _load_ckpt_state(ckpt_path: Path) -> dict[str, torch.Tensor]:
@@ -109,6 +127,14 @@ def parse_args() -> argparse.Namespace:
         default="speechbrain/asr-transformer-transformerlm-librispeech",
         help="HF repo id for the rescoring LM; expects lm.ckpt + tokenizer.ckpt.",
     )
+    # --- CTC n-best rescoring. 0.0 disables; uses the already-trained CTC head. ---
+    p.add_argument(
+        "--ctc_weight",
+        type=float,
+        default=0.3,
+        help="Weight on CTC sequence log-prob (length-normalized) in n-best rescoring. "
+             "0 disables. Matches the training ctc_weight by default (ESPnet convention).",
+    )
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--wandb_run_name", dest="run_name", default=None)
     p.add_argument("--wandb_tags", dest="tags", default=None, help="comma-separated")
@@ -123,6 +149,20 @@ def main() -> None:
     setup_cache_dir(cfg.data.cache_dir)
     resolve_precision(cfg.train)
 
+    # Multi-GPU eval: launch with `torchrun --nproc_per_node=N scripts/evaluate.py ...`.
+    # WORLD_SIZE unset (== 1) is the single-GPU path — no process group, no sharding.
+    world_size = _world_size()
+    rank = _rank()
+    local_rank = _local_rank()
+    is_main = _is_main()
+    distributed = world_size > 1
+    if distributed:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            # NCCL for GPU collectives. `torchrun` sets MASTER_ADDR/PORT automatically.
+            dist.init_process_group(backend="nccl")
+
     if args.run_name:
         cfg.wandb.run_name = args.run_name
     if args.tags:
@@ -135,13 +175,20 @@ def main() -> None:
     tokenizer_dir = args.tokenizer_dir or cfg.data.tokenizer_dir
     tokenizer = load_tokenizer(tokenizer_dir, cache_dir=cfg.data.cache_dir)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        # Each rank pinned to its own GPU; required for NCCL collectives (including
+        # all_gather_object, which serializes through a CUDA ByteTensor).
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    else:
+        device = "cpu"
     # Rebuild the architecture via ``build_model`` (which wires in the custom
-    # ``MelConformerEncoder``) instead of ``SpeechEncoderDecoderModel.from_pretrained``
-    # — the latter would instantiate the stock ``Wav2Vec2ConformerModel``
-    # (raw-waveform CNN frontend) because ``MelConformerEncoder`` isn't a
-    # registered HF model, and then ``generate()`` would try to convolve a
-    # raw-waveform kernel over the log-Mel features.
+    # mel-input encoder with its configured downsampler) instead of
+    # ``SpeechEncoderDecoderModel.from_pretrained`` — the latter would
+    # instantiate the stock ``Wav2Vec2ConformerModel`` (raw-waveform CNN
+    # frontend) because our encoder isn't a registered HF model, and then
+    # ``generate()`` would try to convolve a raw-waveform kernel over the
+    # log-Mel features.
     model = build_model(cfg.model, tokenizer)
     ckpt_paths = [Path(args.checkpoint)] + [Path(p) for p in (args.avg_checkpoints or [])]
     if len(ckpt_paths) == 1:
@@ -178,10 +225,19 @@ def main() -> None:
     ds = ds.cast_column("audio", Audio(sampling_rate=cfg.data.sampling_rate))
     if args.max_samples is not None:
         ds = ds.select(range(min(args.max_samples, len(ds))))
+    # Shard across ranks AFTER max_samples so the flag means "total samples
+    # across all GPUs", δεν per-rank. ``contiguous=True`` preserves original
+    # order within each shard (helpful for group_by_length-style batching,
+    # though eval doesn't do that).
+    full_len = len(ds)
+    if distributed:
+        ds = ds.shard(num_shards=world_size, index=rank, contiguous=True)
+        print(f"[rank {rank}/{world_size}] shard size: {len(ds)} (total: {full_len})")
 
     # Force wandb on for evaluate.py even if the training config disabled it,
     # as long as the user didn't pass --no_wandb. Init BEFORE inference so any
-    # generation errors are still captured by the run.
+    # generation errors are still captured by the run. Rank-0 only under DDP so
+    # we get one wandb run per evaluation, δεν one per GPU.
     force_report = "wandb" if (cfg.wandb.enabled and not args.no_wandb) else "none"
     cfg.train.report_to = force_report
     wandb_run = init_wandb(
@@ -194,15 +250,23 @@ def main() -> None:
             "batch_size": args.batch_size,
             "max_samples": args.max_samples or len(ds),
             "lm_weight": args.lm_weight,
+            "ctc_weight": args.ctc_weight,
             "len_penalty": args.len_penalty,
             "lm_repo": args.lm_repo if args.lm_weight > 0 else None,
+            "world_size": world_size,
         },
         job_type="eval",
-    )
+    ) if is_main else None
 
-    rescore = args.lm_weight > 0
+    ctc_rescore = args.ctc_weight > 0.0
+    if ctc_rescore and not hasattr(model, "ctc_head"):
+        raise ValueError(
+            "--ctc_weight > 0 but the loaded model has no CTC head. "
+            "Set model.ctc_enabled=true in the config (and retrain), or pass --ctc_weight 0."
+        )
+    rescore = args.lm_weight > 0 or ctc_rescore
     lm_scorer = None
-    if rescore:
+    if args.lm_weight > 0:
         from conformer_asr.sb_lm import SBLMScorer
 
         print(f"Loading SpeechBrain LM from {args.lm_repo} (device={device})")
@@ -216,7 +280,11 @@ def main() -> None:
     autocast_dtype = _autocast_dtype(cfg.train) if device == "cuda" else torch.float32
     use_autocast = device == "cuda" and autocast_dtype != torch.float32
 
-    for start in tqdm(range(0, len(ds), args.batch_size), desc=f"generate({args.split})"):
+    for start in tqdm(
+        range(0, len(ds), args.batch_size),
+        desc=f"generate({args.split})",
+        disable=not is_main,
+    ):
         batch = ds[start : start + args.batch_size]
         audios = [np.asarray(a["array"], dtype=np.float32) for a in batch["audio"]]
         # Compute log-Mel per sample, then right-pad to batch max along time.
@@ -274,14 +342,90 @@ def main() -> None:
             bsz = len(audios)
             k = args.num_beams
             hyp_texts = tokenizer.batch_decode(seqs, skip_special_tokens=True)
-            # LM expects uppercase (SB's SentencePiece was trained on uppercase LibriSpeech text).
-            lm_scores = lm_scorer.score_hypotheses(hyp_texts)  # (B*k,)
             # Token lengths post-detokenize; use word count as a proxy for the length-penalty term
             # since the acoustic score is already length-normalized by HF's default.
             word_lens = torch.tensor(
                 [max(1, len(t.split())) for t in hyp_texts], dtype=torch.float32
             )
-            total = ac_scores.cpu().float() + args.lm_weight * lm_scores + args.len_penalty * word_lens
+            total = ac_scores.cpu().float() + args.len_penalty * word_lens
+
+            if args.lm_weight > 0:
+                # LM expects uppercase (SB's SentencePiece was trained on uppercase LibriSpeech text).
+                lm_scores = lm_scorer.score_hypotheses(hyp_texts)  # (B*k,)
+                total = total + args.lm_weight * lm_scores
+
+            if ctc_rescore:
+                # Extra encoder pass to get CTC logits — generate() doesn't expose them,
+                # and the cost is negligible at eval time. One pass per batch, not per beam.
+                with torch.no_grad(), torch.autocast(
+                    device_type="cuda", dtype=autocast_dtype, enabled=use_autocast
+                ):
+                    enc_out = model.encoder(
+                        input_features=input_features,
+                        attention_mask=attention_mask,
+                        return_dict=True,
+                    )
+                enc_hidden = enc_out[0]  # (B, T', H)
+                enc_mask = model.encoder._get_feature_vector_attention_mask(
+                    enc_hidden.size(1), attention_mask
+                )
+                ctc_logits = model.ctc_head(enc_hidden)  # (B, T', V)
+
+                B, T_enc, V = ctc_logits.shape
+                # (B, T', V) -> (B*k, T', V) by expanding each sample across its k beams.
+                expanded_logits = (
+                    ctc_logits.unsqueeze(1)
+                    .expand(B, k, T_enc, V)
+                    .reshape(B * k, T_enc, V)
+                )
+                input_lens = enc_mask.sum(-1).long()
+                expanded_input_lens = (
+                    input_lens.unsqueeze(1).expand(B, k).reshape(-1)
+                )  # (B*k,)
+
+                # Build CTC targets from beam hypotheses, stripping bos/eos/pad.
+                specials = {
+                    tokenizer.pad_token_id,
+                    tokenizer.bos_token_id,
+                    tokenizer.eos_token_id,
+                }
+                tgts_list: list[list[int]] = [
+                    [t for t in h if t not in specials] for h in seqs.tolist()
+                ]
+                raw_lens = [len(t) for t in tgts_list]
+                # Clamp to >=1 for CTC bookkeeping; empty hypotheses will get zero_infinity=True
+                # handling but still need a non-zero length to index into the padded tensor.
+                tgt_lens = torch.tensor(
+                    [max(1, n) for n in raw_lens], dtype=torch.long, device=device
+                )
+                max_tl = int(tgt_lens.max().item())
+                padded = torch.zeros((B * k, max_tl), dtype=torch.long, device=device)
+                for i, t in enumerate(tgts_list):
+                    if t:
+                        padded[i, : len(t)] = torch.tensor(
+                            t, dtype=torch.long, device=device
+                        )
+
+                # CTC log-sum-exp is unstable in fp16/bf16; fp32 like the training path.
+                log_probs = (
+                    F.log_softmax(expanded_logits, dim=-1)
+                    .transpose(0, 1)
+                    .float()
+                )  # (T', B*k, V)
+                ctc_nll = F.ctc_loss(
+                    log_probs,
+                    padded,
+                    expanded_input_lens,
+                    tgt_lens,
+                    blank=model.ctc_blank_id,
+                    reduction="none",
+                    zero_infinity=True,
+                )  # (B*k,) — summed -log P over alignments, per hypothesis
+                # Length-normalize so the CTC term is on the same per-token scale as
+                # HF's length-normalized sequences_scores (default length_penalty=1.0).
+                ctc_logp_norm = (-ctc_nll / tgt_lens.float()).cpu()
+                total = total + args.ctc_weight * ctc_logp_norm
+
             total = total.view(bsz, k)
             best = total.argmax(dim=1)  # (B,)
             preds = [hyp_texts[i * k + best[i].item()] for i in range(bsz)]
@@ -290,6 +434,26 @@ def main() -> None:
         refs = [normalize_text(t) for t in batch["text"]]
         preds_all.extend(preds)
         refs_all.extend(refs)
+
+    # Gather per-rank shards onto rank 0 for a single WER computation over the
+    # concatenated lists (mean-of-per-shard WERs would be wrong — WER is a
+    # global ratio of edit distance to total reference length, δεν an average).
+    # ``all_gather_object`` pickles the lists through a CUDA ByteTensor under
+    # NCCL, so every rank must have its device set (done above).
+    if distributed:
+        import torch.distributed as dist
+
+        gathered_preds: list[list[str]] = [[] for _ in range(world_size)]
+        gathered_refs: list[list[str]] = [[] for _ in range(world_size)]
+        dist.all_gather_object(gathered_preds, preds_all)
+        dist.all_gather_object(gathered_refs, refs_all)
+        if is_main:
+            preds_all = [p for shard in gathered_preds for p in shard]
+            refs_all = [r for shard in gathered_refs for r in shard]
+
+    if not is_main:
+        dist.destroy_process_group()
+        return
 
     score = compute_wer(preds_all, refs_all)
     result = {
@@ -300,6 +464,7 @@ def main() -> None:
         "no_repeat_ngram_size": args.no_repeat_ngram_size,
         "repetition_penalty": args.repetition_penalty,
         "lm_weight": args.lm_weight,
+        "ctc_weight": args.ctc_weight,
         "len_penalty": args.len_penalty,
         "lm_repo": args.lm_repo if args.lm_weight > 0 else None,
         "num_samples": len(preds_all),
@@ -345,6 +510,11 @@ def main() -> None:
                 table.add_data(ref, pred)
             wandb.log({f"eval/{args.split}/predictions": table})
         wandb.finish()
+
+    if distributed:
+        import torch.distributed as dist
+
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

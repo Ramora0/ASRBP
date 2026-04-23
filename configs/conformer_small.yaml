@@ -30,7 +30,7 @@ data:
   test_split: test.clean
   sampling_rate: 16000
   max_audio_seconds: 20.0
-  num_proc: 8
+  num_proc: 48        # one worker per core on the prep node; thread pools are pinned to 1 in scripts/preprocess.py so they don't oversubscribe
   tokenizer_dir: tokenizer
   cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache   # HF datasets + transformers cache
 

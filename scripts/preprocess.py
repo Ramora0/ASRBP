@@ -16,10 +16,25 @@ Example::
 """
 from __future__ import annotations
 
-import argparse
-import sys
-import time
-from pathlib import Path
+import os
+
+# Each worker should be single-threaded — we already parallelize via num_proc.
+# Without this, torch / numpy / MKL / OpenBLAS / tokenizers each default their
+# own thread pool to the full core count, so with num_proc=48 on a 48-core box
+# you get 48 × 48 ≈ 2300 threads fighting for 48 cores. That presents as
+# single-digit CPU% per worker (everyone blocked in the scheduler) instead of
+# near-100%. Must be set before the first import of torch / numpy / datasets /
+# tokenizers — they read these at import time.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+import argparse  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -55,6 +70,17 @@ def _flatten_overrides(args: argparse.Namespace) -> dict:
 
 
 def main() -> None:
+    # Belt-and-braces: even if some library ignored OMP_NUM_THREADS, force
+    # torch's intraop thread pool to 1. (set_num_interop_threads raises if the
+    # pool is already initialized, so we try it but don't hard-fail.)
+    import torch
+
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
     args = parse_args()
     cfg = load_config(args.config, overrides=_flatten_overrides(args))
     setup_cache_dir(cfg.data.cache_dir)

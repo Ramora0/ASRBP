@@ -190,7 +190,7 @@ def preprocess_dataset(
         ds[split] = ds[split].map(
             prepare_batched,
             batched=True,
-            batch_size=64,
+            batch_size=256,
             remove_columns=remove_cols[split],
             num_proc=cfg.num_proc,
             desc=f"preprocess {split}",

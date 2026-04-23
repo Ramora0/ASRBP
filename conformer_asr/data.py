@@ -300,12 +300,19 @@ def preprocess_dataset(
         split: [c for c in ds[split].column_names if c not in {"input_length"}]
         for split in ds
     }
+    # Scale the map input batch by speed count so the per-worker in-flight
+    # output (``batch_size * len(speeds)`` mel tensors at ~640 KB each) stays
+    # roughly the same magnitude regardless of how many speed variants we emit.
+    # Without this, num_proc=48 × 3-way perturb pushed ~15 GB of extra RAM into
+    # worker memory just from in-flight output batches.
+    OUTPUT_BATCH_TARGET = 256
     for split in ds:
         speeds = train_speeds if split == "train" else eval_speeds
+        split_batch_size = max(1, OUTPUT_BATCH_TARGET // max(1, len(speeds)))
         ds[split] = ds[split].map(
             make_prepare(speeds),
             batched=True,
-            batch_size=256,
+            batch_size=split_batch_size,
             remove_columns=remove_cols[split],
             num_proc=num_proc,
             desc=f"preprocess {split}",

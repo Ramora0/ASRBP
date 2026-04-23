@@ -42,7 +42,7 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     output_dir: str = "outputs/run"
-    per_device_train_batch_size: int = 8
+    per_device_train_batch_size: int = 16
     per_device_eval_batch_size: int = 8
     gradient_accumulation_steps: int = 4
     learning_rate: float = 5e-4
@@ -55,7 +55,7 @@ class TrainConfig:
     max_grad_norm: float = 1.0
     label_smoothing_factor: float = 0.1
     lr_scheduler_type: str = "cosine"
-    logging_steps: int = 100
+    logging_steps: int = 20
     save_total_limit: int = 3
     bf16: bool = True
     fp16: bool = False

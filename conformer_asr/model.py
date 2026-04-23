@@ -106,7 +106,7 @@ def _build_encoder_config(mcfg: ModelConfig) -> Wav2Vec2ConformerConfig:
         num_attention_heads=mcfg.encoder_num_attention_heads,
         intermediate_size=mcfg.encoder_intermediate_size,
         conv_depthwise_kernel_size=mcfg.encoder_conv_depthwise_kernel_size,
-        position_embeddings_type="relative",
+        position_embeddings_type="rotary",
         mask_time_prob=mcfg.encoder_mask_time_prob,
         mask_feature_prob=mcfg.encoder_mask_feature_prob,
         hidden_dropout=0.1,

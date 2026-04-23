@@ -89,10 +89,16 @@ def main() -> None:
             f"No model.safetensors or pytorch_model.bin in {ckpt_path}"
         )
     missing, unexpected = model.load_state_dict(state, strict=False)
+    total_keys = len(state)
+    loaded = total_keys - len(unexpected)
+    print(
+        f"[state_dict] loaded {loaded}/{total_keys} tensors "
+        f"(missing={len(missing)}, unexpected={len(unexpected)})"
+    )
     if missing:
-        print(f"[warn] missing state_dict keys ({len(missing)}); first few: {missing[:5]}")
+        print(f"[state_dict] first 10 missing: {missing[:10]}")
     if unexpected:
-        print(f"[warn] unexpected state_dict keys ({len(unexpected)}); first few: {unexpected[:5]}")
+        print(f"[state_dict] first 10 unexpected: {unexpected[:10]}")
     model = model.to(device).eval()
     n_mels = cfg.model.n_mels
     n_fft = cfg.model.n_fft
@@ -190,6 +196,15 @@ def main() -> None:
         json.dump(existing, fh, indent=2)
 
     print(json.dumps(result, indent=2))
+
+    # Print a few ref/hyp pairs so huge unexpected WERs (98%+) can be
+    # eyeballed: garbled predictions vs. a tokenization/case mismatch look
+    # very different.
+    n_show = min(10, len(preds_all))
+    print(f"\nSample predictions (first {n_show}):")
+    for i in range(n_show):
+        print(f"  REF: {refs_all[i]}")
+        print(f"  HYP: {preds_all[i]}\n")
 
     if wandb_run is not None:
         import wandb

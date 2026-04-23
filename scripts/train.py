@@ -196,6 +196,34 @@ class DualProgressCallback(TrainerCallback):
         self.overall_bar.write(str(shown))
 
 
+class EpochCheckpointRenameCallback(TrainerCallback):
+    """Rename ``checkpoint-<global_step>`` → ``checkpoint-<epoch>`` after save.
+
+    HF Trainer names checkpoints by global_step, but under ``save_strategy='epoch'``
+    the epoch index is the meaningful identifier. We keep the ``checkpoint-``
+    prefix and a trailing integer so ``_rotate_checkpoints`` (which globs
+    ``checkpoint-*`` and sorts by the trailing number) still prunes correctly.
+    Also updates ``state.best_model_checkpoint`` so ``load_best_model_at_end``
+    can find the renamed directory.
+    """
+
+    def on_save(self, args, state, control, **kwargs):
+        from pathlib import Path as _Path
+
+        step_dir = _Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        if not step_dir.exists():
+            return
+        epoch = int(round(state.epoch or 0))
+        epoch_dir = _Path(args.output_dir) / f"checkpoint-{epoch}"
+        # Avoid clobbering an existing epoch dir from a resumed run that
+        # re-saves the same epoch boundary.
+        if epoch_dir.exists():
+            return
+        step_dir.rename(epoch_dir)
+        if state.best_model_checkpoint and _Path(state.best_model_checkpoint) == step_dir:
+            state.best_model_checkpoint = str(epoch_dir)
+
+
 class OneShotEvalCallback(TrainerCallback):
     """Fire eval exactly once at a given ``global_step``.
 
@@ -510,6 +538,9 @@ def main() -> None:
         )
         callbacks.append(OneShotEvalCallback(target_step=target_step))
     callbacks.append(EmptyCacheCallback())
+    # Must run AFTER EmptyCacheCallback has done its work but order here doesn't
+    # matter; on_save only needs the saved directory to exist on disk.
+    callbacks.append(EpochCheckpointRenameCallback())
 
     trainer_cls = HybridSeq2SeqTrainer if cfg.model.ctc_enabled else Seq2SeqTrainer
     trainer = trainer_cls(

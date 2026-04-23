@@ -319,9 +319,12 @@ def main() -> None:
         group_by_length=cfg.train.group_by_length,
         length_column_name="input_length",
         optim="adamw_torch_fused",
-        # All params participate in every forward (AED, no CTC branch, no
-        # conditional sub-modules), so DDP can skip the unused-param scan.
-        ddp_find_unused_parameters=False,
+        # A few params inside ``Wav2Vec2ConformerEncoder`` (e.g. the
+        # ``pos_conv_embed`` submodule — conv + layernorm ≈ 3 params) are
+        # instantiated unconditionally but only used on non-rotary position-
+        # embedding paths. We're on rotary, so they never feed into loss, and
+        # DDP crashes on step 2 without this flag. Small per-step scan cost.
+        ddp_find_unused_parameters=True,
     )
 
     # Order matters: EmptyCacheCallback must run AFTER PredictionsTableCallback

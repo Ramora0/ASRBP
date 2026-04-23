@@ -20,11 +20,11 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from datasets import Audio, load_dataset  # noqa: E402
 from tqdm import tqdm  # noqa: E402
-from transformers import SpeechEncoderDecoderModel  # noqa: E402
 
 from conformer_asr.config import autocast_dtype as _autocast_dtype, load_config, resolve_precision  # noqa: E402
 from conformer_asr.data import setup_cache_dir  # noqa: E402
 from conformer_asr.features import log_mel_spectrogram  # noqa: E402
+from conformer_asr.model import build_model  # noqa: E402
 from conformer_asr.tokenizer import load_tokenizer, normalize_text  # noqa: E402
 from conformer_asr.wandb_utils import init_wandb  # noqa: E402
 
@@ -64,12 +64,36 @@ def main() -> None:
         cfg.wandb.enabled = False
 
     tokenizer_dir = args.tokenizer_dir or cfg.data.tokenizer_dir
+    tokenizer = load_tokenizer(tokenizer_dir)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading model from {args.checkpoint} (device={device})")
-    model = SpeechEncoderDecoderModel.from_pretrained(args.checkpoint).to(device).eval()
+    # Rebuild the architecture via ``build_model`` (which wires in the custom
+    # ``MelConformerEncoder``) instead of ``SpeechEncoderDecoderModel.from_pretrained``
+    # — the latter would instantiate the stock ``Wav2Vec2ConformerModel``
+    # (raw-waveform CNN frontend) because ``MelConformerEncoder`` isn't a
+    # registered HF model, and then ``generate()`` would try to convolve a
+    # raw-waveform kernel over the log-Mel features.
+    print(f"Building model architecture and loading weights from {args.checkpoint} (device={device})")
+    model = build_model(cfg.model, tokenizer)
+    ckpt_path = Path(args.checkpoint)
+    safetensors_file = ckpt_path / "model.safetensors"
+    pt_file = ckpt_path / "pytorch_model.bin"
+    if safetensors_file.exists():
+        from safetensors.torch import load_file
 
-    tokenizer = load_tokenizer(tokenizer_dir)
+        state = load_file(str(safetensors_file))
+    elif pt_file.exists():
+        state = torch.load(str(pt_file), map_location="cpu")
+    else:
+        raise FileNotFoundError(
+            f"No model.safetensors or pytorch_model.bin in {ckpt_path}"
+        )
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[warn] missing state_dict keys ({len(missing)}); first few: {missing[:5]}")
+    if unexpected:
+        print(f"[warn] unexpected state_dict keys ({len(unexpected)}); first few: {unexpected[:5]}")
+    model = model.to(device).eval()
     n_mels = cfg.model.n_mels
     n_fft = cfg.model.n_fft
     hop_length = cfg.model.hop_length

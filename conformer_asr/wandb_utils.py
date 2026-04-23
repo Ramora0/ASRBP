@@ -166,6 +166,23 @@ class PredictionsTableCallback(TrainerCallback):
                 self._wandb = None
         return self._wandb
 
+    @staticmethod
+    def _flush_cuda_cache():
+        """Return cached blocks from the PyTorch caching allocator to the driver.
+
+        The main eval loop leaves a heap full of variable-size KV-cache and
+        attention-scratch blocks. Generating on 16 more samples right after can
+        push peak memory into OOM on V100 32GB under DDP. ``empty_cache`` frees
+        those blocks so the upcoming generate sees a clean pool.
+        """
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def on_evaluate(
         self,
         args: TrainingArguments,
@@ -181,6 +198,10 @@ class PredictionsTableCallback(TrainerCallback):
 
         import torch
 
+        # Flush the allocator before we do our own generate — the main eval
+        # loop just filled the cache with blocks sized for its own batches.
+        self._flush_cuda_cache()
+
         model.eval()
         device = next(model.parameters()).device
         batch = self.data_collator(self.sample_features)
@@ -190,22 +211,30 @@ class PredictionsTableCallback(TrainerCallback):
             attention_mask = attention_mask.to(device)
 
         gen_kwargs = {"max_length": args.generation_max_length, "num_beams": 1}
-        with torch.no_grad():
-            generated = model.generate(
-                input_features=input_features,
-                attention_mask=attention_mask,
-                **gen_kwargs,
-            )
-        labels = batch["labels"]
-        # -100 → pad for decoding
-        labels = labels.masked_fill(labels == -100, self.tokenizer.pad_token_id)
-        preds = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
-        refs = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        try:
+            with torch.no_grad():
+                generated = model.generate(
+                    input_features=input_features,
+                    attention_mask=attention_mask,
+                    **gen_kwargs,
+                )
+            labels = batch["labels"]
+            # -100 → pad for decoding
+            labels = labels.masked_fill(labels == -100, self.tokenizer.pad_token_id)
+            preds = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+            refs = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-        table = wandb.Table(columns=["step", "epoch", "reference", "prediction"])
-        for ref, pred in zip(refs, preds):
-            table.add_data(state.global_step, state.epoch, ref, pred)
-        wandb.log(
-            {"eval/sample_predictions": table, "epoch": state.epoch},
-            step=state.global_step,
-        )
+            table = wandb.Table(columns=["step", "epoch", "reference", "prediction"])
+            for ref, pred in zip(refs, preds):
+                table.add_data(state.global_step, state.epoch, ref, pred)
+            wandb.log(
+                {"eval/sample_predictions": table, "epoch": state.epoch},
+                step=state.global_step,
+            )
+        finally:
+            # Drop our own generate's KV cache before the next epoch's
+            # training steps start allocating activations.
+            del batch, input_features
+            if attention_mask is not None:
+                del attention_mask
+            self._flush_cuda_cache()

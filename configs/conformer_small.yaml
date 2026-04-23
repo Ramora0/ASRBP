@@ -9,6 +9,11 @@ model:
   encoder_conv_depthwise_kernel_size: 31
   encoder_mask_time_prob: 0.05
   encoder_mask_feature_prob: 0.05
+  # Dropouts lowered from the paper's 0.1 — pure-AED from scratch on a 20-epoch
+  # budget is underfit, not overfit; regularization here was suppressing fit.
+  encoder_hidden_dropout: 0.05
+  encoder_attention_dropout: 0.05
+  encoder_activation_dropout: 0.05
   # Log-Mel frontend. 80 bins, 25 ms window, 10 ms hop — 100 Hz frame rate,
   # then the Conv2d subsampling stem in the encoder downsamples to ~25 Hz.
   n_mels: 80
@@ -20,7 +25,7 @@ model:
   decoder_layers: 4
   decoder_attention_heads: 4
   decoder_ffn_dim: 1024
-  decoder_dropout: 0.1
+  decoder_dropout: 0.05
   decoder_max_position_embeddings: 448
 
 data:
@@ -30,7 +35,7 @@ data:
   test_split: test.clean
   sampling_rate: 16000
   max_audio_seconds: 20.0
-  num_proc: 48        # one worker per core on the prep node; thread pools are pinned to 1 in scripts/preprocess.py so they don't oversubscribe
+  num_proc: 40        # one worker per core on the 40-core node; thread pools are pinned to 1 in scripts/preprocess.py so they don't oversubscribe
   tokenizer_dir: tokenizer
   cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache   # HF datasets + transformers cache
 
@@ -38,18 +43,22 @@ train:
   output_dir: outputs/run
   per_device_train_batch_size: 64
   per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 4
-  learning_rate: 5.0e-4
-  warmup_ratio: 0.06
+  # 4 × V100 × 64 × 1 = 256 effective batch. Matches the single-GPU target so
+  # LR / warmup schedules stay directly comparable across hardware configs.
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-3
+  # Fixed-step warmup (ESPnet / SpeechBrain / Gulati all use absolute steps,
+  # not a ratio). 2500 steps at eff batch 256 ≈ 2.3 epochs of all960 warmup.
+  warmup_steps: 2500
   num_train_epochs: 20.0
-  weight_decay: 1.0e-2
+  weight_decay: 1.0e-4
   adam_beta1: 0.9
   adam_beta2: 0.98
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
   label_smoothing_factor: 0.1
-  lr_scheduler_type: cosine
-  logging_steps: 20
+  lr_scheduler_type: inverse_sqrt
+  logging_steps: 10
   save_total_limit: 3
   bf16: true
   fp16: false
@@ -71,4 +80,6 @@ wandb:
   notes: ""
   watch_model: false      # true to log gradients/weights (heavy)
   log_preds_table: true   # log sample predictions table during eval
-  log_preds_n: 32
+  # 16 samples (halved from 32) to reduce the peak VRAM hit on rank 0 when the
+  # predictions-table callback runs its own generate() during eval on V100 32GB.
+  log_preds_n: 16

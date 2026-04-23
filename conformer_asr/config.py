@@ -16,6 +16,9 @@ class ModelConfig:
     encoder_conv_depthwise_kernel_size: int
     encoder_mask_time_prob: float
     encoder_mask_feature_prob: float
+    encoder_hidden_dropout: float
+    encoder_attention_dropout: float
+    encoder_activation_dropout: float
     # Log-Mel frontend (see conformer_asr/features.py). Mel features are
     # computed offline at preprocess time; the encoder's Conv2d subsampling
     # stem consumes them directly — no waveform feature encoder.
@@ -50,7 +53,7 @@ class TrainConfig:
     per_device_eval_batch_size: int
     gradient_accumulation_steps: int
     learning_rate: float
-    warmup_ratio: float
+    warmup_steps: int
     num_train_epochs: float
     weight_decay: float
     adam_beta1: float

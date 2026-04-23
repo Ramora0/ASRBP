@@ -2,10 +2,26 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+def _is_main_process() -> bool:
+    """True on rank 0 under torchrun / single-GPU runs.
+
+    ``RANK`` is set by ``torchrun`` / SLURM-launched DDP. Unset on single-GPU
+    runs (which are always rank 0). We can't use ``torch.distributed`` here
+    because the process group isn't initialized yet — Trainer does that later
+    in ``TrainingArguments._setup_devices``.
+    """
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
 
 # --- HF cache bootstrap: MUST run before any ``datasets`` / ``transformers`` / ---
 # --- ``conformer_asr.*`` import, otherwise HF snapshots the wrong cache paths. ---
@@ -25,6 +41,8 @@ from transformers.trainer_callback import ProgressCallback  # noqa: E402
 from conformer_asr.config import load_config, resolve_precision  # noqa: E402
 from conformer_asr.data import (  # noqa: E402
     DataCollatorSpeechSeq2SeqWithPadding,
+    _preprocess_cache_dir,
+    _preprocess_cache_key,
     load_librispeech,
     preprocess_dataset,
     setup_cache_dir,
@@ -38,6 +56,37 @@ from conformer_asr.wandb_utils import (  # noqa: E402
     init_wandb,
     wandb_is_enabled,
 )
+
+
+class EmptyCacheCallback(TrainerCallback):
+    """Flush the CUDA caching allocator around validation.
+
+    Training accumulates many variable-size cached blocks under ``group_by_length``.
+    When eval then asks for a large contiguous KV cache for ``generate()`` +
+    ``PredictionsTableCallback``, the allocator can't find a big enough block
+    in the cached pool and grows the heap — so peak memory creeps up every
+    epoch even though live usage is stable. ``empty_cache`` returns unused
+    cached blocks to the driver; ``gc.collect`` first so any Python-referenced
+    tensors are dropped before we release.
+    """
+
+    def _flush(self):
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        # Fires before eval (eval_strategy="epoch" runs after on_epoch_end).
+        self._flush()
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        # Fires after eval — reclaim the KV cache / generation workspace
+        # before the next epoch's training steps re-allocate activations.
+        self._flush()
 
 
 class DualProgressCallback(TrainerCallback):
@@ -128,7 +177,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--per_device_eval_batch_size", type=int)
     p.add_argument("--gradient_accumulation_steps", type=int)
     p.add_argument("--learning_rate", type=float)
-    p.add_argument("--warmup_ratio", type=float)
+    p.add_argument("--warmup_steps", type=int)
     p.add_argument("--tokenizer_dir")
     p.add_argument("--cache_dir", help="overrides data.cache_dir")
     p.add_argument("--report_to", help="e.g. 'wandb', 'tensorboard', or 'wandb,tensorboard'")
@@ -172,8 +221,29 @@ def main() -> None:
     # V100 / Volta doesn't support bf16 — fall back to fp16 automatically.
     resolve_precision(cfg.train)
 
+    # Let fp16/bf16 matmuls use reduced-precision intermediate accumulation.
+    # ~1-2% throughput win on V100 fp16, imperceptible numerical impact for ASR.
+    import torch
+
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+
     print(f"Loading tokenizer from {cfg.data.tokenizer_dir}")
     tokenizer = load_tokenizer(cfg.data.tokenizer_dir)
+
+    # Under DDP, N ranks calling preprocess_dataset() concurrently would race on
+    # save_to_disk() and duplicate 100+ GB of feature extraction. Require the
+    # cache to be pre-baked via scripts/preprocess.py before multi-GPU launch;
+    # all ranks then just load_from_disk the finished arrow shards.
+    if _world_size() > 1:
+        key = _preprocess_cache_key(cfg.model, tokenizer, cfg.data)
+        save_dir = _preprocess_cache_dir(cfg.data, key)
+        if save_dir is None or not save_dir.exists():
+            raise RuntimeError(
+                f"Preprocessed cache not found at {save_dir}. "
+                "Run `python scripts/preprocess.py --config <config>` on a single "
+                "process before launching multi-GPU training."
+            )
 
     print("Loading LibriSpeech …")
     ds = load_librispeech(cfg.data)
@@ -187,7 +257,9 @@ def main() -> None:
     print(f"Model parameters: {n_params / 1e6:.1f}M ({n_trainable / 1e6:.1f}M trainable)")
 
     # Initialize wandb BEFORE constructing the Trainer so HF's WandbCallback
-    # picks up our run (instead of starting its own).
+    # picks up our run (instead of starting its own). Rank-0 only under DDP —
+    # HF's WandbCallback also no-ops on non-zero ranks, so the other ranks never
+    # touch wandb.
     wandb_run = init_wandb(
         cfg,
         extra_config={
@@ -198,7 +270,7 @@ def main() -> None:
             "tokenizer_vocab_size": len(tokenizer),
             "resume_from_checkpoint": args.resume_from_checkpoint,
         },
-    )
+    ) if _is_main_process() else None
     if wandb_run is not None:
         wandb_run.summary["n_parameters"] = n_params
         wandb_run.summary["n_trainable_parameters"] = n_trainable
@@ -216,7 +288,7 @@ def main() -> None:
         per_device_eval_batch_size=cfg.train.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
         learning_rate=cfg.train.learning_rate,
-        warmup_ratio=cfg.train.warmup_ratio,
+        warmup_steps=cfg.train.warmup_steps,
         num_train_epochs=cfg.train.num_train_epochs,
         weight_decay=cfg.train.weight_decay,
         adam_beta1=cfg.train.adam_beta1,
@@ -242,11 +314,19 @@ def main() -> None:
         metric_for_best_model="wer",
         greater_is_better=False,
         dataloader_num_workers=cfg.train.dataloader_num_workers,
+        dataloader_persistent_workers=True,
         remove_unused_columns=False,
         group_by_length=cfg.train.group_by_length,
         length_column_name="input_length",
+        optim="adamw_torch_fused",
+        # All params participate in every forward (AED, no CTC branch, no
+        # conditional sub-modules), so DDP can skip the unused-param scan.
+        ddp_find_unused_parameters=False,
     )
 
+    # Order matters: EmptyCacheCallback must run AFTER PredictionsTableCallback
+    # (HF fires callbacks in list order), so we flush the allocator once both
+    # the main eval loop and the predictions-table generation pass are done.
     callbacks = []
     if wandb_is_enabled(cfg):
         callbacks.append(EpochLoggerCallback())
@@ -259,6 +339,7 @@ def main() -> None:
                     n_samples=cfg.wandb.log_preds_n,
                 )
             )
+    callbacks.append(EmptyCacheCallback())
 
     trainer = Seq2SeqTrainer(
         model=model,
@@ -286,10 +367,14 @@ def main() -> None:
 
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     final_dir = Path(cfg.train.output_dir) / "final"
+    # ``trainer.save_model`` is DDP-aware (saves on rank 0 only); guard the
+    # tokenizer + artifact upload explicitly so non-zero ranks don't race on
+    # the same output directory.
     trainer.save_model(str(final_dir))
-    tokenizer.save_pretrained(str(final_dir))
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(str(final_dir))
 
-    if wandb_run is not None:
+    if wandb_run is not None and trainer.is_world_process_zero():
         import wandb
 
         # Save the final model as a wandb Artifact for easy downstream eval.

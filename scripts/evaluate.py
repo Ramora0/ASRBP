@@ -46,16 +46,42 @@ def _is_main() -> bool:
     return _rank() == 0
 
 
+def _remap_legacy_keys(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Translate pre-refactor checkpoint key names to current module layout.
+
+    Old training runs saved the Conv2d stem as ``encoder.subsample.*`` and the
+    projection as ``encoder.proj.*`` (flat). The refactored encoder nests them
+    under ``encoder.downsampler.convs.*`` / ``encoder.downsampler.proj.*``.
+    Also re-ties ``decoder.lm_head.weight`` to the decoder embedding when the
+    checkpoint only stored the tied copy.
+    """
+    remapped: dict[str, torch.Tensor] = {}
+    for k, v in state.items():
+        nk = k
+        if nk.startswith("encoder.subsample."):
+            nk = nk.replace("encoder.subsample.", "encoder.downsampler.convs.", 1)
+        elif nk.startswith("encoder.proj."):
+            nk = nk.replace("encoder.proj.", "encoder.downsampler.proj.", 1)
+        remapped[nk] = v
+    emb_key = "decoder.model.decoder.embed_tokens.weight"
+    head_key = "decoder.lm_head.weight"
+    if head_key not in remapped and emb_key in remapped:
+        remapped[head_key] = remapped[emb_key]
+    return remapped
+
+
 def _load_ckpt_state(ckpt_path: Path) -> dict[str, torch.Tensor]:
     safetensors_file = ckpt_path / "model.safetensors"
     pt_file = ckpt_path / "pytorch_model.bin"
     if safetensors_file.exists():
         from safetensors.torch import load_file
 
-        return load_file(str(safetensors_file))
-    if pt_file.exists():
-        return torch.load(str(pt_file), map_location="cpu")
-    raise FileNotFoundError(f"No model.safetensors or pytorch_model.bin in {ckpt_path}")
+        raw = load_file(str(safetensors_file))
+    elif pt_file.exists():
+        raw = torch.load(str(pt_file), map_location="cpu")
+    else:
+        raise FileNotFoundError(f"No model.safetensors or pytorch_model.bin in {ckpt_path}")
+    return _remap_legacy_keys(raw)
 
 
 def _average_state_dicts(states: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -230,6 +256,15 @@ def main() -> None:
     rescore = args.lm_weight > 0 or ctc_rescore
     lm_scorer = None
     if args.lm_weight > 0:
+        # Stub torchaudio before SpeechBrain pulls it in — this environment has
+        # torchaudio 2.11 compiled against libcudart.so.13 but torch 2.6+cu124,
+        # so the real import fails. The LM path only needs TransformerLM, which
+        # doesn't touch any torchaudio symbol.
+        import sys as _sys
+        if "torchaudio" not in _sys.modules:
+            _ta = type(_sys)("torchaudio")
+            _ta.__version__ = "0.0.0"
+            _sys.modules["torchaudio"] = _ta
         from conformer_asr.sb_lm import SBLMScorer
 
         print(f"Loading SpeechBrain LM from {args.lm_repo} (device={device})")

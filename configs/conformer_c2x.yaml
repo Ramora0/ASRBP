@@ -135,7 +135,7 @@ wandb:
   enabled: true
   project: conformer-asr-librispeech
   entity: null
-  run_name: null          # null → wandb auto-generates; override from CLI to set
+  run_name: conformer-c2x
   group: null
   tags: []
   notes: ""

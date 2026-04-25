@@ -438,7 +438,7 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default="configs/conformer_small.yaml")
+    p.add_argument("--config", default="configs/conformer_c4x.yaml")
     p.add_argument("--subset", choices=["clean100", "clean460", "all960"])
     p.add_argument("--output_dir")
     p.add_argument("--num_train_epochs", type=float)

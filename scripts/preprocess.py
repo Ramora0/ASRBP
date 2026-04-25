@@ -58,7 +58,7 @@ from conformer_asr.tokenizer import load_tokenizer  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default="configs/conformer_small.yaml")
+    p.add_argument("--config", default="configs/conformer_c4x.yaml")
     p.add_argument("--subset", choices=["clean100", "clean460", "all960"])
     p.add_argument("--num_proc", type=int, help="Override data.num_proc")
     p.add_argument("--cache_dir", help="Override data.cache_dir")

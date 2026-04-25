@@ -15,7 +15,7 @@ uv pip install -e .
 python scripts/smoke_test.py
 
 # Preprocess the dataset once (required before multi-GPU training to avoid racing on save_to_disk)
-python scripts/preprocess.py --config configs/conformer_small.yaml
+python scripts/preprocess.py --config configs/conformer_c4x.yaml
 
 # Train (defaults = full 960h, --subset clean100 for fast iteration)
 python scripts/train.py --output_dir outputs/run
@@ -49,7 +49,7 @@ The SDPA fast-path patch for `Wav2Vec2ConformerSelfAttention` lives in `conforme
 
 ### Config flow
 
-All configuration is a `Config` dataclass tree (`ModelConfig`, `DataConfig`, `TrainConfig`, `WandbConfig`) in `conformer_asr/config.py`. `ModelConfig.downsampler` is a nested `DownsamplerConfig` (`type: str`, `kwargs: dict`). `load_config(path, overrides)` loads YAML then applies flat CLI overrides by looking up which section owns each key — so new CLI flags in scripts work as long as the key name matches a top-level dataclass field. Nested sub-configs (e.g. `model.downsampler`) aren't reachable from the flat CLI surface; edit the YAML for those. Defaults in `configs/conformer_small.yaml` must stay in sync with dataclass defaults.
+All configuration is a `Config` dataclass tree (`ModelConfig`, `DataConfig`, `TrainConfig`, `WandbConfig`) in `conformer_asr/config.py`. `ModelConfig.downsampler` is a nested `DownsamplerConfig` (`type: str`, `kwargs: dict`). `load_config(path, overrides)` loads YAML then applies flat CLI overrides by looking up which section owns each key — so new CLI flags in scripts work as long as the key name matches a top-level dataclass field. Nested sub-configs (e.g. `model.downsampler`) aren't reachable from the flat CLI surface; edit the YAML for those. Defaults in `configs/conformer_c4x.yaml` must stay in sync with dataclass defaults.
 
 ### Tokenizer
 

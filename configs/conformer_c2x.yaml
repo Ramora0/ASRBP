@@ -87,7 +87,7 @@ data:
   cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache   # HF datasets + transformers cache
 
 train:
-  output_dir: outputs/run
+  output_dir: outputs/run-c2x
   per_device_train_batch_size: 64
   per_device_eval_batch_size: 8
   # 4 × V100 × 64 × 1 = 256 effective batch. Matches the single-GPU target so
@@ -101,7 +101,7 @@ train:
   # the absolute number here made warmup ~45% of training, starving the
   # model of sustained peak-LR updates.
   warmup_steps: 2500
-  num_train_epochs: 20.0
+  num_train_epochs: 30.0
   weight_decay: 1.0e-4
   adam_beta1: 0.9
   adam_beta2: 0.98

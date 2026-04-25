@@ -91,10 +91,12 @@ train:
   output_dir: outputs/run-c2x-whisper
   per_device_train_batch_size: 32
   per_device_eval_batch_size: 8
-  # 4 × V100 × 32 × 2 = 256 effective batch. Same memory profile as c2x: at
-  # 2× downsampling the encoder sees 2× more frames than c4x, so per-device
-  # batch is halved + grad accum doubled to keep effective batch at 256.
-  gradient_accumulation_steps: 2
+  # Effective batch held at 256. Per-device batch halved relative to c4x (32
+  # vs 64) because at 2× downsampling the encoder sees 2× more frames, so
+  # per-device memory is higher. With grad_accum=0, scripts/train.py
+  # auto-derives grad_accum from WORLD_SIZE (e.g. 4 GPUs → 2, 1 GPU → 8).
+  effective_batch_size: 256
+  gradient_accumulation_steps: 0
   learning_rate: 1.0e-3
   # Fixed-step warmup (ESPnet / SpeechBrain / Gulati all use absolute steps,
   # not a ratio). At eff batch 256 × ~1100 steps/epoch × 20 epochs ≈ 22k

@@ -40,7 +40,12 @@ from transformers import (  # noqa: E402
 )
 from transformers.trainer_callback import ProgressCallback  # noqa: E402
 
-from conformer_asr.config import autocast_dtype, load_config, resolve_precision  # noqa: E402
+from conformer_asr.config import (  # noqa: E402
+    autocast_dtype,
+    load_config,
+    resolve_grad_accum,
+    resolve_precision,
+)
 from conformer_asr.data import (  # noqa: E402
     DataCollatorSpeechSeq2SeqWithPadding,
     RandomSpeedVariantSampler,
@@ -506,6 +511,18 @@ def main() -> None:
 
     # V100 / Volta doesn't support bf16 — fall back to fp16 automatically.
     resolve_precision(cfg.train)
+
+    # Derive gradient_accumulation_steps from effective_batch_size and the
+    # runtime WORLD_SIZE if it wasn't pinned in the YAML / on the CLI. Keeps
+    # effective batch constant across 1 / 2 / 4 / 8-GPU runs.
+    resolve_grad_accum(cfg.train, _world_size())
+    if _is_main_process():
+        print(
+            f"[batch] effective_batch_size={cfg.train.effective_batch_size}  "
+            f"per_device={cfg.train.per_device_train_batch_size}  "
+            f"world_size={_world_size()}  "
+            f"gradient_accumulation_steps={cfg.train.gradient_accumulation_steps}"
+        )
 
     # Let fp16/bf16 matmuls use reduced-precision intermediate accumulation.
     # ~1-2% throughput win on V100 fp16, imperceptible numerical impact for ASR.

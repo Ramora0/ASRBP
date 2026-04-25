@@ -90,9 +90,12 @@ train:
   output_dir: outputs/run-c2x
   per_device_train_batch_size: 32
   per_device_eval_batch_size: 8
-  # 4 × V100 × 32 × 2 = 256 effective batch. Matches the single-GPU target so
-  # LR / warmup schedules stay directly comparable across hardware configs.
-  gradient_accumulation_steps: 2
+  # Effective batch held at 256 across hardware configs. With grad_accum=0
+  # below, scripts/train.py auto-derives grad_accum from WORLD_SIZE so the
+  # same YAML gives 256 effective batch on 1/2/4/8 GPUs (e.g. 4×V100×32 → 2,
+  # 1×A100×32 → 8). Set grad_accum to a positive integer to override.
+  effective_batch_size: 256
+  gradient_accumulation_steps: 0
   learning_rate: 1.0e-3
   # Fixed-step warmup (ESPnet / SpeechBrain / Gulati all use absolute steps,
   # not a ratio). At eff batch 256 × ~1100 steps/epoch × 20 epochs ≈ 22k

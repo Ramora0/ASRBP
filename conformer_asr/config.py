@@ -120,6 +120,14 @@ class TrainConfig:
     output_dir: str
     per_device_train_batch_size: int
     per_device_eval_batch_size: int
+    # Target effective batch size = per_device_train_batch_size * world_size *
+    # gradient_accumulation_steps. With ``gradient_accumulation_steps: 0`` in
+    # the YAML (or unset on the CLI), ``resolve_grad_accum`` computes
+    # grad_accum from this and the runtime ``WORLD_SIZE`` so the same config
+    # gives the same effective batch on 1 / 2 / 4 / 8 GPUs without manual
+    # editing. Set ``gradient_accumulation_steps`` to a positive integer to
+    # override and trust whatever effective batch falls out.
+    effective_batch_size: int
     gradient_accumulation_steps: int
     learning_rate: float
     warmup_steps: int
@@ -214,6 +222,49 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
                     setattr(section, key, val)
                     break
     return cfg
+
+
+def resolve_grad_accum(train_cfg: TrainConfig, world_size: int) -> None:
+    """Derive ``gradient_accumulation_steps`` from ``effective_batch_size``.
+
+    If ``train_cfg.gradient_accumulation_steps`` is 0, computes
+    ``effective_batch_size // (per_device_train_batch_size * world_size)``
+    and writes it back. If it's a positive integer, leaves it alone (manual
+    override). Raises if the auto-compute doesn't divide evenly or yields a
+    value < 1, since silently rounding either way would change effective
+    batch behind the user's back.
+    """
+    if train_cfg.gradient_accumulation_steps > 0:
+        return
+    if train_cfg.gradient_accumulation_steps < 0:
+        raise ValueError(
+            f"gradient_accumulation_steps must be >= 0, got {train_cfg.gradient_accumulation_steps}"
+        )
+    ws = max(1, world_size)
+    per_step = train_cfg.per_device_train_batch_size * ws
+    if per_step <= 0:
+        raise ValueError(
+            f"per_device_train_batch_size * world_size = {per_step} (must be > 0)"
+        )
+    eff = train_cfg.effective_batch_size
+    if eff <= 0:
+        raise ValueError(f"effective_batch_size must be > 0, got {eff}")
+    if eff % per_step != 0:
+        raise ValueError(
+            f"effective_batch_size={eff} is not divisible by "
+            f"per_device_train_batch_size * world_size = "
+            f"{train_cfg.per_device_train_batch_size} * {ws} = {per_step}. "
+            f"Adjust per_device_train_batch_size or effective_batch_size, "
+            f"or set gradient_accumulation_steps explicitly."
+        )
+    grad_accum = eff // per_step
+    if grad_accum < 1:
+        raise ValueError(
+            f"Derived gradient_accumulation_steps={grad_accum} < 1: "
+            f"per_device_train_batch_size * world_size ({per_step}) "
+            f"already exceeds effective_batch_size ({eff})."
+        )
+    train_cfg.gradient_accumulation_steps = grad_accum
 
 
 def resolve_precision(train_cfg: TrainConfig) -> None:

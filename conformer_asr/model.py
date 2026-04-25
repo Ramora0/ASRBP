@@ -184,6 +184,19 @@ class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
         else:
             total_loss = aed_loss
 
+        # Dynamic downsamplers (e.g. boundary predictor) carry an auxiliary
+        # loss alongside their pooled output. The loss is computed during the
+        # encoder's forward and stashed on the downsampler; we read it here
+        # and fold it into the training total. ``aux_loss`` returns ``None``
+        # for static downsamplers (default) and outside training, so this is
+        # a no-op in those cases.
+        downsampler = getattr(self.encoder, "downsampler", None)
+        aux_loss_fn = getattr(downsampler, "aux_loss", None) if downsampler is not None else None
+        if total_loss is not None and aux_loss_fn is not None:
+            aux = aux_loss_fn()
+            if aux is not None:
+                total_loss = total_loss + aux.to(total_loss.dtype)
+
         output = ConformerAEDWithCTCOutput(
             loss=total_loss,
             logits=aed_outputs.logits,

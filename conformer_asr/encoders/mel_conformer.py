@@ -98,7 +98,11 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         x = self.spec_augment(x, attention_mask=attention_mask)
 
         # 3. Downsampler stem: (B, T_mel, n_mels) → (B, T', hidden).
-        x = self.downsampler(x)
+        # Dynamic downsamplers (e.g. boundary predictor) need per-sample valid
+        # lengths to mask padding before pooling — pass them through; static
+        # downsamplers ignore the kwarg.
+        input_lengths = attention_mask.sum(-1) if attention_mask is not None else None
+        x = self.downsampler(x, input_lengths=input_lengths)
         t_out = x.shape[1]
 
         # Downsample the pre-stem attention mask so the Conformer blocks see

@@ -113,7 +113,7 @@ def _average_state_dicts(states: list[dict[str, torch.Tensor]]) -> dict[str, tor
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default="configs/conformer_c4x.yaml")
+    p.add_argument("--config", default="configs/cnns/c4x.yaml")
     p.add_argument("--checkpoint", required=True, help="Path to saved model directory")
     p.add_argument(
         "--avg_checkpoints",

@@ -115,7 +115,15 @@ class Conv2dDownsampler(Downsampler):
             lengths = _length_after(lengths, t)
         return lengths
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_lengths: torch.LongTensor | None = None,
+    ) -> torch.Tensor:
+        # ``input_lengths`` is unused — Conv2d output length is a pure function
+        # of the input length (see ``output_lengths``); the encoder builds the
+        # attention mask separately. Accepted only to match the base interface.
+        del input_lengths
         # (B, T, n_mels) -> (B, 1, T, n_mels) -> conv stack -> (B, H, T', M')
         x = x.unsqueeze(1)
         x = self.convs(x)

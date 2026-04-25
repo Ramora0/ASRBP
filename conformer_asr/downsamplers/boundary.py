@@ -1,0 +1,296 @@
+"""Boundary-predictor downsampler.
+
+Conv2d frontend → MLP-predicted segment boundaries → mean pooling. Ported
+from ``SpeechbrainBP/boundary_predictor.py`` and folded into this codebase's
+``Downsampler`` interface.
+
+Pipeline inside ``forward``:
+  1. ``Conv2dDownsampler`` frontend bridges ``(B, T_mel, n_mels)`` to
+     ``(B, T_cnn, hidden)`` and reduces the frame rate (default 4× — same
+     stem the rest of the project uses).
+  2. A 2-layer MLP scores each frame, sigmoid → per-frame boundary
+     probability.
+  3. During training: ``RelaxedBernoulli`` rsample for differentiable soft
+     boundaries, threshold at 0.5 for the hard pass, straight-through
+     estimator wires gradients through the soft path. During eval: hard
+     threshold on the sigmoid probability directly (no sampling noise).
+  4. Force the last valid frame of each sample to be a boundary, mask
+     padded frames to zero — guarantees at least one segment per sample.
+  5. Mean-pool hidden states by segment id (cumsum-derived).
+
+Two pieces of state are written to the module on every ``forward`` and
+consumed by the rest of the model:
+
+  - ``output_lengths``: per-sample boundary count, returned by
+    ``output_lengths()`` so the Conformer encoder's attention mask and the
+    CTC head's input-lengths argument both see the right valid range.
+  - ``aux_loss``: a scalar negative-log-prob under
+    ``Binomial(n=actual_lens, p=prior)`` of the realized boundary count,
+    scaled by ``loss_weight``. ``ConformerAEDWithCTC`` reads it via
+    ``aux_loss()`` and adds it to the training total. Eval-time and
+    forced-mode forwards return ``None`` (no aux loss).
+"""
+from __future__ import annotations
+
+from typing import Sequence
+
+import torch
+import torch.nn as nn
+
+from .base import Downsampler
+from .conv2d import Conv2dDownsampler
+
+
+def _segment_indicator(boundaries: torch.Tensor) -> torch.Tensor | None:
+    """Cumsum-based segment assignment.
+
+    Returns ``[B, L, S]`` where ``out[b, t, s] == 0`` iff position ``t`` in
+    sample ``b`` belongs to segment ``s``. ``S`` is the batch-max number of
+    segments. Returns ``None`` if no boundary fired anywhere in the batch
+    (caller falls back to an empty pooled output).
+    """
+    n_segments = int(boundaries.sum(dim=-1).max().item())
+    if n_segments == 0:
+        return None
+    seg_idx = torch.arange(n_segments, device=boundaries.device)
+    cum = boundaries.cumsum(1) - boundaries
+    return seg_idx.view(1, 1, -1) - cum.unsqueeze(-1)
+
+
+class BoundaryPredictorDownsampler(Downsampler):
+    """Conv2d frontend → boundary-predictor mean pooling.
+
+    Args:
+        n_mels: Mel-bin count (passed straight through to the frontend).
+        hidden: Transformer hidden size (frontend output dim and MLP width).
+        dropout: Dropout after the frontend's projection (frontend kwarg).
+        strides: Per-layer ``[time, mel]`` strides for the frontend Conv2d
+            stack (same convention as ``Conv2dDownsampler``). Default
+            ``[[1,2],[2,2]]`` matches the project's Whisper-style 2× stem
+            (one stride-1 context-mixing layer + one stride-2 subsampling
+            layer); paired with the default ``prior=0.25`` this targets
+            ~8× total downsampling (2× conv × 4× BP).
+        prior: Target boundary fraction in the binomial prior loss. With
+            the default Whisper-style 2× frontend, ``0.25`` ⇒ ~8× total;
+            ``0.5`` ⇒ ~4× total.
+        temp: ``RelaxedBernoulli`` temperature for the soft-sample path
+            during training. Higher ⇒ softer / noisier; lower ⇒ closer to
+            the hard threshold (and lower-variance gradients). ``0.1`` is
+            sharp — close to a deterministic threshold but still
+            differentiable for the straight-through path.
+        mlp_dropout: Dropout in front of the boundary MLP.
+        loss_weight: Scalar multiplier applied to the binomial prior loss
+            before it's surfaced via ``aux_loss()``. ``10.0`` matches the
+            SpeechbrainBP recipe.
+        boundary_mode: ``"learned"`` (default), ``"all"`` (every frame is
+            a boundary — pass-through, debug), or ``"alternating"`` (every
+            other frame — fixed 2× compression for sanity checks). Only
+            ``"learned"`` carries the binomial loss.
+    """
+
+    def __init__(
+        self,
+        n_mels: int,
+        hidden: int,
+        dropout: float = 0.0,
+        *,
+        strides: Sequence[Sequence[int]] = ((1, 2), (2, 2)),
+        prior: float = 0.25,
+        temp: float = 0.1,
+        mlp_dropout: float = 0.1,
+        loss_weight: float = 10.0,
+        boundary_mode: str = "learned",
+    ):
+        super().__init__()
+        if boundary_mode not in {"learned", "all", "alternating"}:
+            raise ValueError(
+                f"boundary_mode must be one of {{learned, all, alternating}}, "
+                f"got {boundary_mode!r}"
+            )
+        self.frontend = Conv2dDownsampler(
+            n_mels=n_mels, hidden=hidden, strides=strides, dropout=dropout
+        )
+        self.hidden = int(hidden)
+        self.prior = float(prior)
+        self.temp = float(temp)
+        self.loss_weight = float(loss_weight)
+        self.boundary_mode = boundary_mode
+
+        self.boundary_mlp = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+        self.mlp_dropout = nn.Dropout(p=mlp_dropout)
+
+        self._cached_lengths: torch.LongTensor | None = None
+        self._cached_aux_loss: torch.Tensor | None = None
+
+    # ------------------------------------------------------------- public API
+
+    def aux_loss(self) -> torch.Tensor | None:
+        return self._cached_aux_loss
+
+    def output_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
+        """Dynamic — returns the per-sample boundary counts cached by the
+        most-recent ``forward``. Falls back to the frontend's static
+        upper-bound when called before any forward (e.g. instrumentation).
+
+        Under ``generate()`` with beam search, the decoder's cross-attention
+        mask is built from a beam-expanded ``attention_mask`` (``B`` →
+        ``B * num_beams`` along dim 0), but the encoder ran once on the
+        un-expanded batch, so the cache holds ``B`` entries. We detect that
+        case (matching length up to an integer multiplier) and
+        ``repeat_interleave`` the cached lengths to match — HF beam-expands
+        by the same pattern, so the per-beam alignment is preserved.
+        """
+        cached = self._cached_lengths
+        if cached is None:
+            return self.frontend.output_lengths(input_lengths)
+        n_in = input_lengths.shape[0]
+        n_cache = cached.shape[0]
+        if n_in == n_cache:
+            return cached
+        if n_in > 0 and n_in % n_cache == 0:
+            return cached.repeat_interleave(n_in // n_cache)
+        # Mismatched in a way we don't recognize; fall back to the static
+        # upper bound rather than crashing on a shape mismatch downstream.
+        return self.frontend.output_lengths(input_lengths)
+
+    def set_prior(self, prior: float) -> None:
+        self.prior = float(prior)
+
+    def set_temperature(self, temp: float) -> None:
+        self.temp = float(temp)
+
+    # ------------------------------------------------------------- internals
+
+    def _apply_length_mask(
+        self,
+        boundaries: torch.Tensor,
+        valid_mask: torch.Tensor,
+        actual_lens: torch.Tensor,
+        T_cnn: int,
+    ) -> torch.Tensor:
+        # Zero out boundaries in padded positions, then force the last valid
+        # frame to be a boundary so every sample has at least one segment.
+        B = boundaries.shape[0]
+        boundaries = boundaries * valid_mask
+        last_valid_idx = torch.clamp(actual_lens - 1, min=0, max=T_cnn - 1)
+        batch_idx = torch.arange(B, device=boundaries.device)
+        boundaries = boundaries.clone()
+        boundaries[batch_idx, last_valid_idx] = 1.0
+        return boundaries
+
+    def _learned_boundaries(
+        self,
+        h: torch.Tensor,
+        valid_mask: torch.Tensor,
+        actual_lens: torch.Tensor,
+        T_cnn: int,
+    ) -> torch.Tensor:
+        # Run the boundary head in fp32 so RelaxedBernoulli is stable under
+        # bf16/fp16 autocast (the distribution rejects half-precision probs).
+        logits = self.boundary_mlp(self.mlp_dropout(h)).squeeze(-1).float()
+        probs = torch.sigmoid(logits)
+
+        if self.training:
+            dist = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
+                temperature=self.temp, probs=probs,
+            )
+            soft = dist.rsample()
+        else:
+            soft = probs
+
+        hard_samples = (soft > 0.5).float()
+
+        soft = self._apply_length_mask(soft, valid_mask, actual_lens, T_cnn)
+        hard_samples = self._apply_length_mask(hard_samples, valid_mask, actual_lens, T_cnn)
+        # Straight-through: forward path uses the hard threshold, backward
+        # path flows through the soft (RelaxedBernoulli sample) values.
+        return hard_samples - soft.detach() + soft
+
+    def _forced_boundaries(
+        self,
+        T_cnn: int,
+        every_n: int,
+        valid_mask: torch.Tensor,
+        actual_lens: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if every_n == 1:
+            b = torch.ones(batch_size, T_cnn, device=device)
+        else:
+            b = torch.zeros(batch_size, T_cnn, device=device)
+            b[:, every_n - 1::every_n] = 1.0
+        return self._apply_length_mask(b, valid_mask, actual_lens, T_cnn)
+
+    def _mean_pool(self, boundaries: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        B, _, D = h.shape
+        ind = _segment_indicator(boundaries)
+        if ind is None:
+            return torch.zeros(B, 0, D, device=h.device, dtype=h.dtype)
+        weights = 1 - ind
+        weights = weights.masked_fill(ind != 0, 0.0)
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-9)
+        # einsum: (B, L, S) x (B, L, D) -> (B, S, D). Cast weights to h.dtype
+        # so the matmul stays in the encoder's autocast precision.
+        return torch.einsum("bls,bld->bsd", weights.to(h.dtype), h)
+
+    def _binomial_loss(
+        self,
+        boundaries: torch.Tensor,
+        actual_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        # Per-sample -log P(num_boundaries | Binomial(n=actual_lens, p=prior)),
+        # length-normalized then averaged over the batch.
+        binomial = torch.distributions.binomial.Binomial(
+            total_count=actual_lens.float(),
+            probs=torch.tensor([self.prior], device=boundaries.device),
+        )
+        num_boundaries = boundaries.sum(dim=1)
+        per_sample = -binomial.log_prob(num_boundaries) / actual_lens.float().clamp(min=1)
+        return per_sample.mean()
+
+    # --------------------------------------------------------------- forward
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_lengths: torch.LongTensor | None = None,
+    ) -> torch.Tensor:
+        # 1. Conv2d frontend: (B, T_mel, n_mels) -> (B, T_cnn, hidden).
+        h = self.frontend(x)
+        B, T_cnn, _ = h.shape
+        device = h.device
+
+        # 2. Per-sample valid lengths after the frontend (in T_cnn frames).
+        if input_lengths is None:
+            actual_lens = torch.full((B,), T_cnn, dtype=torch.long, device=device)
+        else:
+            actual_lens = self.frontend.output_lengths(input_lengths.to(device)).long()
+            actual_lens = torch.clamp(actual_lens, min=1, max=T_cnn)
+
+        pos = torch.arange(T_cnn, device=device).unsqueeze(0)
+        valid_mask = (pos < actual_lens.unsqueeze(1)).float()
+
+        # 3. Predict / force boundaries.
+        if self.boundary_mode == "all":
+            boundaries = self._forced_boundaries(T_cnn, 1, valid_mask, actual_lens, B, device)
+        elif self.boundary_mode == "alternating":
+            boundaries = self._forced_boundaries(T_cnn, 2, valid_mask, actual_lens, B, device)
+        else:
+            boundaries = self._learned_boundaries(h, valid_mask, actual_lens, T_cnn)
+
+        # 4. Mean-pool by segment id.
+        pooled = self._mean_pool(boundaries, h)
+
+        # 5. Cache per-sample output lengths and (training-only) aux loss.
+        self._cached_lengths = boundaries.sum(dim=1).long().clamp(min=1)
+        if self.training and self.boundary_mode == "learned":
+            self._cached_aux_loss = self.loss_weight * self._binomial_loss(boundaries, actual_lens)
+        else:
+            self._cached_aux_loss = None
+
+        return pooled

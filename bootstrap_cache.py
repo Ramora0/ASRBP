@@ -91,7 +91,7 @@ def _peek_flag(argv: list[str], name: str) -> str | None:
 
 def bootstrap_cache_from_argv(
     argv: list[str] | None = None,
-    default_config: str = "configs/conformer_c4x.yaml",
+    default_config: str = "configs/cnns/c4x.yaml",
 ) -> str | None:
     """Resolve a cache dir from CLI / env / YAML and apply it.
 

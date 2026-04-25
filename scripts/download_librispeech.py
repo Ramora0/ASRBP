@@ -43,7 +43,7 @@ ALL_SPLITS = [
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default="configs/conformer_c4x.yaml")
+    p.add_argument("--config", default="configs/cnns/c4x.yaml")
     p.add_argument("--cache_dir", default=None, help="overrides data.cache_dir")
     p.add_argument(
         "--splits",

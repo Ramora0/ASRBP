@@ -19,7 +19,7 @@ uv pip install -e .
 ## 0. (Recommended) Pre-download LibriSpeech to scratch
 
 LibriSpeech is ~60 GB once extracted. The default cache location is
-`/fs/scratch/PAS2836/lees_stuff/hf_cache` (set in `configs/conformer_c4x.yaml`
+`/fs/scratch/PAS2836/lees_stuff/hf_cache` (set in `configs/cnns/c4x.yaml`
 under `data.cache_dir`). Every script also sets `HF_HOME`, `HF_DATASETS_CACHE`,
 `HUGGINGFACE_HUB_CACHE`, and `TRANSFORMERS_CACHE` to the same place so sub-processes
 (HF workers, transformers hub downloads) don't scatter files into `$HOME`.
@@ -70,7 +70,7 @@ python scripts/train.py \
   --output_dir outputs/smoke
 ```
 
-Defaults come from `configs/conformer_c4x.yaml`. Any CLI flag overrides the YAML.
+Defaults come from `configs/cnns/c4x.yaml`. Any CLI flag overrides the YAML.
 
 ## 3. Evaluate WER on `test-clean`
 
@@ -112,7 +112,7 @@ Set `wandb.watch_model: true` in the YAML to additionally log gradients and weig
 
 ## Memory and hyperparameters
 
-The default config (`configs/conformer_c4x.yaml`) targets ~50 M parameters and batches of 8 × 20 s clips in bf16, comfortably under 32 GB. To reduce memory further:
+The default config (`configs/cnns/c4x.yaml`) targets ~50 M parameters and batches of 8 × 20 s clips in bf16, comfortably under 32 GB. To reduce memory further:
 
 - lower `per_device_train_batch_size` and raise `gradient_accumulation_steps`
 - lower `max_audio_seconds` (default 20)

@@ -25,15 +25,15 @@ model:
   n_mels: 80
   n_fft: 400
   hop_length: 160
-  # Spectrogram → transformer-input bridge. `conv2d` is the standard ASR stem:
-  # first two Conv2d(k=3, s=2) layers downsample both time and mel axes (4×
-  # time reduction on 80-mel input); any extra convs beyond the first two are
-  # stride (2, 1), adding additional time-only downsampling (8× at num_convs=3,
-  # 16× at 4). See conformer_asr/downsamplers/ for registered options.
+  # Spectrogram → transformer-input bridge. `conv2d` is the standard ASR
+  # stem: one Conv2d layer per `strides` entry, where each entry is
+  # [time_stride, mel_stride]. Kernel per axis is 3 when that axis's stride
+  # is > 1, else 1 (no spread). [2,2] downsamples both axes; [2,1] is
+  # time-only. See conformer_asr/downsamplers/ for registered options.
   downsampler:
     type: conv2d
     kwargs:
-      num_convs: 2
+      strides: [[2, 2], [2, 2]]
   # AED decoder (not in the paper; they used RNN-T). Kept small and proportional
   # to the encoder so total model lands around ~35M params.
   decoder_d_model: 256

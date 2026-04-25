@@ -15,12 +15,14 @@ class DownsamplerConfig:
     ``type`` selects an entry in ``downsamplers.DOWNSAMPLERS``; ``kwargs`` is
     passed through to that implementation's constructor, so adding a new
     downsampler doesn't require touching this schema. The default ``conv2d``
-    stem takes ``num_convs`` (first two are stride ``(2, 2)``, extras are
-    time-only stride ``(2, 1)``).
+    stem takes ``strides``: a list of ``[time, mel]`` pairs, one per Conv2d
+    layer. Kernel is uniformly ``(3, 3)``; padding is 1 on axes with
+    stride 1 (preserves dim, Whisper-style) and 0 elsewhere (standard
+    no-pad subsampling for stride-2 layers).
     """
 
     type: str = "conv2d"
-    kwargs: dict[str, Any] = field(default_factory=lambda: {"num_convs": 2})
+    kwargs: dict[str, Any] = field(default_factory=lambda: {"strides": [[2, 2], [2, 2]]})
 
 
 @dataclass

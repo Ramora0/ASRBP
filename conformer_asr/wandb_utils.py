@@ -496,7 +496,15 @@ class SWACallback(TrainerCallback):
             return
         self.save_dir.mkdir(parents=True, exist_ok=True)
         state_dict = self.swa_model.module.state_dict()
-        torch.save(state_dict, self.save_dir / "pytorch_model.bin")
+        # Save as safetensors to match the format ``trainer.save_model`` writes
+        # for ``final/``, so evaluate.py's safetensors-first loader picks it up
+        # and the two checkpoint dirs are interchangeable. Tie-shared tensors
+        # (e.g. ``decoder.lm_head.weight`` ↔ embedding) must share storage or
+        # ``save_file`` refuses; make each a contiguous clone.
+        from safetensors.torch import save_file
+
+        state_dict = {k: v.detach().contiguous().clone() for k, v in state_dict.items()}
+        save_file(state_dict, str(self.save_dir / "model.safetensors"))
         with open(self.save_dir / "swa_info.json", "w") as f:
             json.dump(
                 {
@@ -509,5 +517,5 @@ class SWACallback(TrainerCallback):
             )
         print(
             f"[swa] wrote {self._updates}-epoch-averaged weights to "
-            f"{self.save_dir}/pytorch_model.bin"
+            f"{self.save_dir}/model.safetensors"
         )

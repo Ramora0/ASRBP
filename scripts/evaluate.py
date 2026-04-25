@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--tokenizer_dir", default=None)
     p.add_argument("--split", default="test.clean")
-    p.add_argument("--num_beams", type=int, default=5)
+    p.add_argument("--num_beams", type=int, default=10)
     p.add_argument("--no_repeat_ngram_size", type=int, default=3,
                    help="If >0, ban repetition of any n-gram of this size during generation. "
                         "Default 3 stops beam-search loops without hurting natural English.")
@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--lm_weight",
         type=float,
-        default=0.0,
+        default=0.05,
         help="Weight on SpeechBrain TransformerLM log-prob in n-best rescoring. 0 disables.",
     )
     p.add_argument(
@@ -156,9 +156,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ctc_weight",
         type=float,
-        default=0.3,
+        default=0.0,
         help="Weight on CTC sequence log-prob (length-normalized) in n-best rescoring. "
-             "0 disables. Matches the training ctc_weight by default (ESPnet convention).",
+             "0 disables.",
     )
     return p.parse_args()
 

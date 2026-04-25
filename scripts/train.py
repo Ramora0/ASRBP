@@ -709,6 +709,24 @@ def main() -> None:
     if is_main:
         tokenizer.save_pretrained(str(final_dir))
 
+        # If SWA ran, make ``final-swa/`` a drop-in checkpoint dir by copying
+        # over the config + tokenizer metadata ``trainer.save_model`` wrote to
+        # ``final/``. Only the weights themselves differ between the two dirs.
+        swa_dir = Path(cfg.train.output_dir) / "final-swa"
+        if cfg.train.swa_enabled and (swa_dir / "model.safetensors").exists():
+            import shutil
+
+            for name in (
+                "config.json",
+                "generation_config.json",
+                "training_args.bin",
+                "sentencepiece.model",
+                "tokenizer_info.json",
+            ):
+                src = final_dir / name
+                if src.exists():
+                    shutil.copy2(src, swa_dir / name)
+
     # Post-training evaluation. evaluate.py είναι intentionally wandb-free and
     # single-process; we shell out from rank 0, strip torchrun's distributed env
     # vars so the subprocess doesn't try to re-init NCCL, then push the final

@@ -124,6 +124,7 @@ train:
   gradient_checkpointing: false
   group_by_length: true
   dataloader_num_workers: 8
+  dataloader_prefetch_factor: 4
   report_to: wandb
   seed: 42
   generation_max_length: 300

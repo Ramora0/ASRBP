@@ -68,6 +68,103 @@ from conformer_asr.wandb_utils import (  # noqa: E402
 )
 
 
+class StepTimerCallback(TrainerCallback):
+    """Per-step latency breakdown: total wall time vs. compute vs. data-wait.
+
+    On a healthy GPU-bound run, ``data_wait_ms`` percentiles should sit near 0
+    — workers stay ahead of the GPU. When the percentiles climb (especially
+    p95/p99) the dataloader is starving the GPU; common culprits are network
+    storage latency, too-small ``prefetch_factor``, or worker oversubscription.
+
+    Implementation: ``on_step_begin`` and ``on_step_end`` bracket the compute
+    portion of each micro-step. The gap between ``on_step_end`` of step N and
+    ``on_step_begin`` of step N+1 is data-wait + Python overhead. We log
+    p50 / p95 / p99 of each over the last ``logging_steps`` boundary, both
+    via ``tqdm.write`` and to ``wandb`` if the run is online.
+    """
+
+    def __init__(self) -> None:
+        import time
+
+        self._t = time.perf_counter
+        self._last_begin: float | None = None
+        self._last_end: float | None = None
+        self._compute_ms: list[float] = []
+        self._wait_ms: list[float] = []
+        self._total_ms: list[float] = []
+        # Mirror trainer's logging cadence; updated on first on_step_begin.
+        self._log_every: int = 50
+
+    @staticmethod
+    def _pct(xs: list[float], q: float) -> float:
+        if not xs:
+            return 0.0
+        s = sorted(xs)
+        idx = max(0, min(len(s) - 1, int(round(q * (len(s) - 1)))))
+        return s[idx]
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            now = self._t()
+            if self._last_end is not None:
+                self._wait_ms.append((now - self._last_end) * 1000.0)
+            if self._last_begin is not None:
+                self._total_ms.append((now - self._last_begin) * 1000.0)
+            self._last_begin = now
+            self._log_every = max(10, int(getattr(args, "logging_steps", 50) or 50))
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        now = self._t()
+        if self._last_begin is not None:
+            self._compute_ms.append((now - self._last_begin) * 1000.0)
+        self._last_end = now
+        if len(self._compute_ms) >= self._log_every:
+            p50_c = self._pct(self._compute_ms, 0.50)
+            p95_c = self._pct(self._compute_ms, 0.95)
+            p99_c = self._pct(self._compute_ms, 0.99)
+            p50_w = self._pct(self._wait_ms, 0.50)
+            p95_w = self._pct(self._wait_ms, 0.95)
+            p99_w = self._pct(self._wait_ms, 0.99)
+            p50_t = self._pct(self._total_ms, 0.50)
+            p95_t = self._pct(self._total_ms, 0.95)
+            line = (
+                f"[step-timer N={len(self._compute_ms)}] "
+                f"compute_ms p50={p50_c:.1f}/p95={p95_c:.1f}/p99={p99_c:.1f}  "
+                f"wait_ms p50={p50_w:.1f}/p95={p95_w:.1f}/p99={p99_w:.1f}  "
+                f"total_ms p50={p50_t:.1f}/p95={p95_t:.1f}"
+            )
+            try:
+                from tqdm.auto import tqdm
+
+                tqdm.write(line)
+            except Exception:
+                print(line)
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log(
+                        {
+                            "perf/compute_ms_p50": p50_c,
+                            "perf/compute_ms_p95": p95_c,
+                            "perf/compute_ms_p99": p99_c,
+                            "perf/wait_ms_p50": p50_w,
+                            "perf/wait_ms_p95": p95_w,
+                            "perf/wait_ms_p99": p99_w,
+                            "perf/total_ms_p50": p50_t,
+                            "perf/total_ms_p95": p95_t,
+                        },
+                        step=state.global_step,
+                    )
+            except Exception:
+                pass
+            self._compute_ms.clear()
+            self._wait_ms.clear()
+            self._total_ms.clear()
+
+
 class EmptyCacheCallback(TrainerCallback):
     """Flush the CUDA caching allocator around validation.
 
@@ -523,6 +620,11 @@ def main() -> None:
             f"world_size={_world_size()}  "
             f"gradient_accumulation_steps={cfg.train.gradient_accumulation_steps}"
         )
+        print(
+            f"[dataloader] num_workers={cfg.train.dataloader_num_workers}  "
+            f"prefetch_factor={cfg.train.dataloader_prefetch_factor}  "
+            f"cache_dir={cfg.data.cache_dir}"
+        )
 
     # Let fp16/bf16 matmuls use reduced-precision intermediate accumulation.
     # ~1-2% throughput win on V100 fp16, imperceptible numerical impact for ASR.
@@ -548,11 +650,24 @@ def main() -> None:
                 "process before launching multi-GPU training."
             )
 
-    print("Loading LibriSpeech …")
-    ds = load_librispeech(cfg.data)
+    # Short-circuit when the preprocessed cache already exists: load it
+    # directly and skip ``load_librispeech``, which otherwise calls
+    # ``datasets.load_dataset`` for each split and re-downloads the raw
+    # 1.2 TB audio archive whenever the HF datasets cache is empty (e.g.
+    # on a fresh per-node /tmp). The preprocessed shards are the only thing
+    # the trainer actually consumes downstream.
+    pre_key = _preprocess_cache_key(cfg.model, tokenizer, cfg.data)
+    pre_dir = _preprocess_cache_dir(cfg.data, pre_key)
+    if pre_dir is not None and pre_dir.exists():
+        from datasets import load_from_disk
 
-    print("Preprocessing dataset (this caches to disk after first run)")
-    ds = preprocess_dataset(ds, cfg.model, tokenizer, cfg.data)
+        print(f"[preprocess] loading cached dataset from {pre_dir} (raw download skipped)")
+        ds = load_from_disk(str(pre_dir))
+    else:
+        print("Loading LibriSpeech …")
+        ds = load_librispeech(cfg.data)
+        print("Preprocessing dataset (this caches to disk after first run)")
+        ds = preprocess_dataset(ds, cfg.model, tokenizer, cfg.data)
 
     model = build_model(cfg.model, tokenizer)
     n_params = sum(p.numel() for p in model.parameters())
@@ -618,6 +733,7 @@ def main() -> None:
         greater_is_better=False,
         dataloader_num_workers=cfg.train.dataloader_num_workers,
         dataloader_persistent_workers=True,
+        dataloader_prefetch_factor=cfg.train.dataloader_prefetch_factor,
         remove_unused_columns=False,
         group_by_length=cfg.train.group_by_length,
         length_column_name="input_length",
@@ -671,6 +787,7 @@ def main() -> None:
             f"({args.early_eval_frac:.1%} of epoch 1, ~{steps_per_epoch} steps/epoch)"
         )
         callbacks.append(OneShotEvalCallback(target_step=target_step))
+    callbacks.append(StepTimerCallback())
     callbacks.append(EmptyCacheCallback())
     # Must run AFTER EmptyCacheCallback has done its work but order here doesn't
     # matter; on_save only needs the saved directory to exist on disk.

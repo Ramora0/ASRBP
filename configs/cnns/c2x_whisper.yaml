@@ -125,6 +125,10 @@ train:
   gradient_checkpointing: false
   group_by_length: true
   dataloader_num_workers: 8
+  # Per-worker batch lookahead. 4 (vs PyTorch's default 2) → 32 batches buffered
+  # across 8 workers. Necessary on GPFS / parallel filesystems where read
+  # latency is bursty.
+  dataloader_prefetch_factor: 4
   report_to: wandb
   seed: 42
   generation_max_length: 300

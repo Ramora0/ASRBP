@@ -146,6 +146,13 @@ class TrainConfig:
     gradient_checkpointing: bool
     group_by_length: bool
     dataloader_num_workers: int
+    # Per-worker batch buffer ahead of the GPU. PyTorch default is 2 (so 8
+    # workers × 2 = 16 batches in flight). On networked storage (GPFS / Lustre)
+    # the read latency variance dominates step time, and 16-batch buffer is
+    # not enough — workers stall on coordinated metadata reads and the GPU
+    # drops to 0% util for 1-2 s windows. 4 doubles the buffer; bump higher
+    # if you still see step-time spikes after staging the cache to local NVMe.
+    dataloader_prefetch_factor: int
     report_to: str
     seed: int
     generation_max_length: int

@@ -65,3 +65,14 @@ class Downsampler(nn.Module, ABC):
         tensor; the model wrapper adds it to the training total.
         """
         return None
+
+    def post_parent_init(self) -> None:
+        """Re-apply any custom parameter init after the parent encoder's
+        ``PreTrainedModel.post_init()`` runs. The HF post-init recursively
+        applies ``_init_weights`` to every submodule, which silently
+        overwrites any tuning a downsampler did in its own ``__init__`` (e.g.
+        biasing the boundary predictor toward a target prior). Encoders MUST
+        call this after their own ``post_init()`` so dynamic downsamplers
+        can restore that state. Default is a no-op for static downsamplers.
+        """
+        return None

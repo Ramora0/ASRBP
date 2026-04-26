@@ -122,6 +122,15 @@ class BoundaryPredictorDownsampler(Downsampler):
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
+        self._init_prior_bias()
+        self.mlp_dropout = nn.Dropout(p=mlp_dropout)
+
+        self._cached_lengths: torch.LongTensor | None = None
+        self._cached_aux_loss: torch.Tensor | None = None
+        self._cached_post_frontend_lens: torch.LongTensor | None = None
+        self._cached_input_lengths: torch.LongTensor | None = None
+
+    def _init_prior_bias(self) -> None:
         # Start the boundary predictor at exactly `prior` regardless of the
         # frontend's init scale: zero the final weight and set the bias to
         # logit(prior), so every per-frame logit is `bias` at step 0 and
@@ -132,12 +141,12 @@ class BoundaryPredictorDownsampler(Downsampler):
             p = min(max(self.prior, 1e-4), 1 - 1e-4)
             self.boundary_mlp[-1].weight.zero_()
             self.boundary_mlp[-1].bias.fill_(math.log(p / (1.0 - p)))
-        self.mlp_dropout = nn.Dropout(p=mlp_dropout)
 
-        self._cached_lengths: torch.LongTensor | None = None
-        self._cached_aux_loss: torch.Tensor | None = None
-        self._cached_post_frontend_lens: torch.LongTensor | None = None
-        self._cached_input_lengths: torch.LongTensor | None = None
+    def post_parent_init(self) -> None:
+        # The parent encoder's HF post_init() recursively re-inits every
+        # nn.Linear under this module — including boundary_mlp[-1] — wiping
+        # the prior-targeted init done in __init__. Re-apply it here.
+        self._init_prior_bias()
 
     # ------------------------------------------------------------- public API
 

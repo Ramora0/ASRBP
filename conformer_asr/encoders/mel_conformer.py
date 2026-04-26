@@ -58,6 +58,11 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         self.encoder = Wav2Vec2ConformerEncoder(config)
 
         self.post_init()
+        # post_init() recurses ``_init_weights`` over every submodule, which
+        # silently overwrites any custom parameter init the downsampler did
+        # in its own __init__ (e.g. biasing the boundary predictor toward a
+        # target prior). Give the downsampler a chance to restore it.
+        self.downsampler.post_parent_init()
 
     def _get_feature_vector_attention_mask(
         self,

@@ -366,8 +366,15 @@ class CTCEvalCallback(TrainerCallback):
                         )
 
                     ctc_logits = outputs.ctc_logits
-                    enc_mask = outputs.encoder_attention_mask
-                    input_lengths = enc_mask.sum(-1).long() if enc_mask is not None else None
+                    # Prefer ``ctc_attention_mask`` so the CTC time dim
+                    # matches the logits even when ``ctc_input='post_cnn'``
+                    # (where the encoder mask is at a *different* rate). Falls
+                    # back to encoder_attention_mask for older checkpoints.
+                    ctc_mask = (
+                        getattr(outputs, "ctc_attention_mask", None)
+                        or outputs.encoder_attention_mask
+                    )
+                    input_lengths = ctc_mask.sum(-1).long() if ctc_mask is not None else None
                     batch_frames = int(input_lengths.sum().item()) if input_lengths is not None else ctc_logits.size(1) * ctc_logits.size(0)
 
                     if outputs.ctc_loss is not None and batch_frames > 0:

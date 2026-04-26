@@ -385,24 +385,37 @@ def main() -> None:
                 enc_mask = model.encoder._get_feature_vector_attention_mask(
                     enc_hidden.size(1), attention_mask
                 )
-                # CTC head reads either the encoder hidden states (default) or
-                # the post-downsampler tensor (``ctc_input='features'``). Both
-                # share the same time dim, so the rest of the rescore path is
-                # identical.
-                if getattr(model, "ctc_input", "encoder") == "features":
+                # CTC head can tap one of three places:
+                #   "encoder"  — post-Conformer hidden states (default)
+                #   "features" — post-downsampler tensor (same T as encoder)
+                #   "post_cnn" — intermediate CNN tensor inside a cross-attn
+                #                downsampler (HIGHER rate, different T)
+                # The mask used downstream by ctc_loss must match whichever
+                # tensor we feed the head.
+                ctc_input_kind = getattr(model, "ctc_input", "encoder")
+                if ctc_input_kind == "features":
                     ctc_source = model.encoder._features_for_ctc
+                    ctc_mask = enc_mask
+                elif ctc_input_kind == "post_cnn":
+                    ctc_source = model.encoder.downsampler._post_cnn_features
+                    ctc_mask = model.encoder._get_post_cnn_attention_mask(
+                        ctc_source.size(1), attention_mask
+                    )
                 else:
                     ctc_source = enc_hidden
-                ctc_logits = model.ctc_head(ctc_source)  # (B, T', V)
+                    ctc_mask = enc_mask
+                ctc_logits = model.ctc_head(ctc_source)  # (B, T_ctc, V)
 
-                B, T_enc, V = ctc_logits.shape
-                # (B, T', V) -> (B*k, T', V) by expanding each sample across its k beams.
+                B, T_ctc, V = ctc_logits.shape
+                # (B, T_ctc, V) -> (B*k, T_ctc, V) by expanding each sample across its k beams.
                 expanded_logits = (
                     ctc_logits.unsqueeze(1)
-                    .expand(B, k, T_enc, V)
-                    .reshape(B * k, T_enc, V)
+                    .expand(B, k, T_ctc, V)
+                    .reshape(B * k, T_ctc, V)
                 )
-                input_lens = enc_mask.sum(-1).long()
+                # Use the *CTC* mask (matches ctc_logits' time dim — different
+                # from enc_mask when ctc_input='post_cnn').
+                input_lens = ctc_mask.sum(-1).long()
                 expanded_input_lens = (
                     input_lens.unsqueeze(1).expand(B, k).reshape(-1)
                 )  # (B*k,)

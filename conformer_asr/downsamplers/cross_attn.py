@@ -211,8 +211,12 @@ class CrossAttnDownsampler(Downsampler):
         super().__init__()
         if stride < 1:
             raise ValueError(f"stride must be >= 1, got {stride}")
-        if num_layers < 1:
-            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+        if num_layers < 0:
+            raise ValueError(f"num_layers must be >= 0, got {num_layers}")
+        # num_layers=0 disables the cross-attn block entirely → the downsampler
+        # becomes a pure conv-stack + strided-pick feature extractor (useful
+        # for ablating whether downstream slowdowns originate from the conv
+        # stack or from the cross-attn block).
         self.n_mels = int(n_mels)
         self.hidden = int(hidden)
         self.stride = int(stride)
@@ -307,6 +311,15 @@ class CrossAttnDownsampler(Downsampler):
             return post
         return torch.div(post + self.stride - 1, self.stride, rounding_mode="floor")
 
+    def post_cnn_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
+        """Per-sample valid time length at the post-conv / pre-pick stage.
+
+        Exposed so an outer CTC head can supervise the post-CNN tensor
+        (``ctc_input='post_cnn'``) and build a matching attention mask. Equal
+        to ``output_lengths`` when ``stride == 1`` (no extra pick stage).
+        """
+        return self._post_conv_lengths(input_lengths)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -323,6 +336,12 @@ class CrossAttnDownsampler(Downsampler):
         h = self.proj(h)
         h = self.proj_dropout(h)
         device = h.device
+
+        # Stash the post-CNN / pre-pick tensor so an outer wrapper (e.g.
+        # ``ConformerAEDWithCTC`` with ``ctc_input='post_cnn'``) can attach a
+        # CTC head at the higher (pre-pick) frame rate without re-running the
+        # conv stack. Plain attribute, kept out of state_dict.
+        self._post_cnn_features = h
 
         # 3. Build a key-padding mask covering padded post-conv positions.
         # SDPA bool-mask convention: True = participates in attention.

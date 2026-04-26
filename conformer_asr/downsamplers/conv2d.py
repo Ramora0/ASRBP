@@ -73,6 +73,7 @@ class Conv2dDownsampler(Downsampler):
         hidden: int,
         strides: Sequence[Sequence[int]] = ((2, 2), (2, 2)),
         dropout: float = 0.0,
+        ctc_tap_after_layer: int | None = None,
     ):
         super().__init__()
         self.n_mels = int(n_mels)
@@ -98,6 +99,36 @@ class Conv2dDownsampler(Downsampler):
         self.proj = nn.Linear(hidden * mel_after, hidden)
         self.dropout = nn.Dropout(dropout)
 
+        # Optional intermediate tap. With ``ctc_tap_after_layer=N``, forward()
+        # stashes a ``(B, T_at_N, hidden)`` tensor on ``_post_cnn_features``
+        # after the first N strided conv layers, projected into ``hidden`` by
+        # its own ``ctc_tap_proj`` (separate weights from the final ``proj``).
+        # Lets a cnns/ config wear two hats: the encoder consumes the
+        # full-stack output (deep / coarse), while a CTC head supervises the
+        # intermediate output (shallow / fine).
+        self.ctc_tap_after_layer: int | None
+        if ctc_tap_after_layer is None:
+            self.ctc_tap_after_layer = None
+            self.ctc_tap_proj = None
+        else:
+            n = int(ctc_tap_after_layer)
+            if not (1 <= n < len(self.strides)):
+                raise ValueError(
+                    f"ctc_tap_after_layer must be in [1, {len(self.strides)-1}] "
+                    f"(strict — at the boundary it would equal the final output); "
+                    f"got {n} with {len(self.strides)} layers."
+                )
+            self.ctc_tap_after_layer = n
+            mel_at_tap = self.n_mels
+            for _, m in self.strides[:n]:
+                mel_at_tap = _length_after(mel_at_tap, m)
+            if mel_at_tap <= 0:
+                raise ValueError(
+                    f"n_mels={self.n_mels} too small for mel strides "
+                    f"{[m for _, m in self.strides[:n]]} at intermediate tap"
+                )
+            self.ctc_tap_proj = nn.Linear(hidden * int(mel_at_tap), hidden)
+
     def _mel_after_convs(self, n_mels: int) -> int:
         l = n_mels
         for _, m in self.strides:
@@ -115,6 +146,23 @@ class Conv2dDownsampler(Downsampler):
             lengths = _length_after(lengths, t)
         return lengths
 
+    def post_cnn_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
+        """Per-sample valid time length at the intermediate CTC tap.
+
+        Same arithmetic as ``output_lengths`` but stops after the first
+        ``ctc_tap_after_layer`` strided layers. Only meaningful when the tap
+        is configured.
+        """
+        if self.ctc_tap_after_layer is None:
+            raise RuntimeError(
+                "post_cnn_lengths called but ctc_tap_after_layer is None — "
+                "Conv2dDownsampler has no intermediate tap configured."
+            )
+        lengths = input_lengths
+        for t, _ in self.strides[: self.ctc_tap_after_layer]:
+            lengths = _length_after(lengths, t)
+        return lengths
+
     def forward(
         self,
         x: torch.Tensor,
@@ -126,7 +174,21 @@ class Conv2dDownsampler(Downsampler):
         del input_lengths
         # (B, T, n_mels) -> (B, 1, T, n_mels) -> conv stack -> (B, H, T', M')
         x = x.unsqueeze(1)
-        x = self.convs(x)
+        if self.ctc_tap_after_layer is None:
+            x = self.convs(x)
+        else:
+            # Iterate so we can tap the intermediate post-Nth-layer tensor.
+            # ``self.convs`` is ``Sequential(Conv, ReLU, Conv, ReLU, ...)`` —
+            # two children per strided layer.
+            n_pre = self.ctc_tap_after_layer * 2
+            children = list(self.convs.children())
+            for layer in children[:n_pre]:
+                x = layer(x)
+            bsz, hidden_dim, t_tap, m_tap = x.shape
+            tap = x.permute(0, 2, 1, 3).reshape(bsz, t_tap, hidden_dim * m_tap)
+            self._post_cnn_features = self.ctc_tap_proj(tap)
+            for layer in children[n_pre:]:
+                x = layer(x)
         bsz, hidden, t_out, m_out = x.shape
         # (B, H, T', M') -> (B, T', H * M') -> (B, T', hidden)
         x = x.permute(0, 2, 1, 3).reshape(bsz, t_out, hidden * m_out)

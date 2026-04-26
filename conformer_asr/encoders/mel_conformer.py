@@ -80,6 +80,30 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         arange = torch.arange(feature_vector_length, device=attention_mask.device)
         return arange[None, :] < output_lengths[:, None]
 
+    def _get_post_cnn_attention_mask(
+        self,
+        post_cnn_length: int,
+        attention_mask: torch.LongTensor,
+    ) -> torch.BoolTensor:
+        """Bool mask for the **post-CNN / pre-pick** stage of the downsampler.
+
+        Used when an outer CTC head taps the downsampler before its picking
+        / pooling stage (``ctc_input='post_cnn'``). The downsampler must
+        expose ``post_cnn_lengths(input_lengths)``; only ``CrossAttnDownsampler``
+        does so today.
+        """
+        if not hasattr(self.downsampler, "post_cnn_lengths"):
+            raise RuntimeError(
+                f"downsampler {type(self.downsampler).__name__} does not "
+                "expose 'post_cnn_lengths'; ctc_input='post_cnn' is only "
+                "supported with downsamplers that have a non-CNN compression "
+                "stage (e.g. cross_attn)."
+            )
+        input_lengths = attention_mask.sum(-1)
+        post_cnn_lens = self.downsampler.post_cnn_lengths(input_lengths)
+        arange = torch.arange(post_cnn_length, device=attention_mask.device)
+        return arange[None, :] < post_cnn_lens[:, None]
+
     def forward(
         self,
         input_features: torch.FloatTensor,

@@ -1,28 +1,38 @@
 """Cross-attention downsampler.
 
-Conv2d frontend → pick every Nth post-frontend vector → cross-attend that
-subset to the full post-frontend sequence to inject temporal context, then
-hand the refined queries to the encoder.
+Conv2d frontend → dilated-conv RF expansion → pick every Nth post-frontend
+vector → cross-attend that subset to the full post-frontend sequence to
+inject temporal context, then hand the refined queries to the encoder.
 
 Pipeline inside ``forward``:
   1. ``Conv2dDownsampler`` frontend bridges ``(B, T_mel, n_mels)`` to
      ``(B, T_cnn, hidden)`` (default: 4× time reduction, matching c4x).
-  2. Pick ``out[:, ::stride, :]`` from the post-frontend sequence to seed
+  2. ``dilation_block``: same-padded dilated Conv1d layers that **preserve
+     rate** while expanding per-frame receptive field. Default
+     ``dilations=(2, 2)`` on top of the c4x frontend lifts each frame's RF
+     from 7 mel frames (c4x) to 39 mel frames — slightly above c16x's RF of
+     31. Combined with the zero-init on the cross-attn output projection
+     below, this makes the downsampler a strict superset of a 16×-RF conv
+     stack at init.
+  3. Pick ``out[:, ::stride, :]`` from the dilation-block output to seed
      queries — these are the eventual encoder inputs after refinement.
      With the default ``stride=4`` on top of the 4× conv stem, total
      downsampling is 16× (≈6.25 Hz on 100 Hz mels).
-  3. ``num_layers`` pre-norm cross-attention blocks: queries = the picked
-     subset (residually updated), keys/values = the full post-frontend
+  4. ``num_layers`` pre-norm cross-attention blocks: queries = the picked
+     subset (residually updated), keys/values = the full post-dilation
      sequence. RoPE is applied to Q/K with positions taken from the
      **original post-frontend indices** — queries get ``[0, stride, 2*stride,
      ...]``, keys get ``[0, 1, ..., T_cnn-1]`` — so the relative offset
-     under RoPE matches the true frame-rate gap. Padded post-frontend
-     positions are masked out of attention.
-  4. Return the refined queries.
+     under RoPE matches the true frame-rate gap. Padded positions are
+     masked out of attention. The output projection is zero-init'd, so at
+     step 0 the cross-attn contributes nothing — the model behaves as
+     "frontend → dilations → strided pick → conformer", a strict superset
+     of a 16× conv stack.
+  5. Return the refined queries.
 
 Output length is a pure function of input length (frontend arithmetic +
-ceil-divide by ``stride``) — this is a static downsampler. ``aux_loss``
-stays at the base-class default ``None``.
+ceil-divide by ``stride``; dilations preserve length) — this is a static
+downsampler. ``aux_loss`` stays at the base-class default ``None``.
 """
 from __future__ import annotations
 
@@ -99,6 +109,13 @@ class _CrossAttnBlock(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
+        # Zero-init the output projection so the cross-attn block contributes
+        # nothing at step 0. The forward then equals the residual passthrough
+        # (queries unchanged), letting the upstream conv stack — frontend +
+        # dilation block — define the model's init behavior.
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
     def _rope_cos_sin(
         self, positions: torch.Tensor, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -144,7 +161,7 @@ class _CrossAttnBlock(nn.Module):
 
 
 class CrossAttnDownsampler(Downsampler):
-    """Conv2d frontend → strided pick → cross-attention refinement.
+    """Conv2d frontend → dilated RF expansion → strided pick → cross-attn.
 
     Args:
         n_mels: Mel-bin count (passed straight through to the frontend).
@@ -155,8 +172,14 @@ class CrossAttnDownsampler(Downsampler):
         strides: Per-layer ``[time, mel]`` strides for the frontend Conv2d
             stack (same convention as ``Conv2dDownsampler``). Default
             ``[[2,2],[2,2]]`` matches c4x — 4× time reduction.
-        stride: Subsample factor applied on top of the frontend. ``out[:,
-            ::stride, :]`` from the post-frontend sequence seeds the queries
+        dilations: Per-layer dilation factors for the post-frontend
+            ``Conv1d`` stack. Each layer is kernel-3, stride-1, padding =
+            dilation, so length is preserved (rate doesn't change). Default
+            ``(2, 2)`` lifts each frame's RF from 7 mel frames (c4x) to 39
+            (slightly above c16x's 31), giving the picked queries a
+            depth-rich representation at init. ``()`` disables the block.
+        stride: Subsample factor applied after the dilation block. ``out[:,
+            ::stride, :]`` from the post-dilation sequence seeds the queries
             for cross-attention. With the default ``stride=4`` on top of the
             4× conv stem, total compression is 16×.
         num_heads: Cross-attention heads.
@@ -172,6 +195,7 @@ class CrossAttnDownsampler(Downsampler):
         dropout: float = 0.0,
         *,
         strides: Sequence[Sequence[int]] = ((2, 2), (2, 2)),
+        dilations: Sequence[int] = (2, 2),
         stride: int = 4,
         num_heads: int = 4,
         num_layers: int = 1,
@@ -187,6 +211,28 @@ class CrossAttnDownsampler(Downsampler):
         )
         self.hidden = int(hidden)
         self.stride = int(stride)
+
+        # Same-padded dilated 1D convs: preserve length, expand RF. Output
+        # length stays equal to the frontend's, so output_lengths arithmetic
+        # is unaffected by this block.
+        dilation_layers: list[nn.Module] = []
+        for d in dilations:
+            d_int = int(d)
+            if d_int < 1:
+                raise ValueError(f"dilations entries must be >= 1, got {d_int}")
+            dilation_layers.append(
+                nn.Conv1d(
+                    int(hidden),
+                    int(hidden),
+                    kernel_size=3,
+                    padding=d_int,
+                    dilation=d_int,
+                )
+            )
+            dilation_layers.append(nn.ReLU())
+        self.dilation_block: nn.Module = (
+            nn.Sequential(*dilation_layers) if dilation_layers else nn.Identity()
+        )
 
         self.layers = nn.ModuleList([
             _CrossAttnBlock(
@@ -217,10 +263,15 @@ class CrossAttnDownsampler(Downsampler):
     ) -> torch.Tensor:
         # 1. Conv2d frontend: (B, T_mel, n_mels) -> (B, T_cnn, hidden).
         h = self.frontend(x)
+
+        # 2. Dilation block: same-padded dilated Conv1d → preserves length,
+        # expands per-frame RF. Conv1d expects (B, C, T), so transpose around it.
+        h = self.dilation_block(h.transpose(1, 2)).transpose(1, 2)
+
         B, T_cnn, _ = h.shape
         device = h.device
 
-        # 2. Build a key-padding mask covering padded post-frontend positions.
+        # 3. Build a key-padding mask covering padded post-frontend positions.
         # SDPA bool-mask convention: True = participates in attention.
         attn_mask: torch.Tensor | None = None
         if input_lengths is not None:
@@ -230,7 +281,7 @@ class CrossAttnDownsampler(Downsampler):
             valid = pos < post_lens.unsqueeze(1)  # (B, T_cnn)
             attn_mask = valid[:, None, None, :]  # (B, 1, 1, T_k); broadcasts over heads + queries
 
-        # 3. Pick every ``stride``-th frame as queries. Track which post-frontend
+        # 4. Pick every ``stride``-th frame as queries. Track which post-frontend
         # indices we picked — those are the RoPE positions for the queries, so
         # the relative offset Q[i] - K[j] under RoPE matches the true gap
         # between picked frame ``i*stride`` and key frame ``j``.
@@ -242,7 +293,9 @@ class CrossAttnDownsampler(Downsampler):
             q_positions = torch.arange(T_cnn, device=device)
         k_positions = torch.arange(T_cnn, device=device)
 
-        # 4. Cross-attend (one or more blocks).
+        # 5. Cross-attend (one or more blocks). With zero-init out_proj, this
+        # is the identity at step 0 — the model behaves as "frontend +
+        # dilations + strided pick + conformer" until cross-attn weights move.
         for layer in self.layers:
             q = layer(q, h, q_positions, k_positions, attn_mask)
 

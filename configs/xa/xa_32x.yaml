@@ -29,12 +29,21 @@ model:
   # gives them more room to gather context from the keys before the
   # conformer stack.
   #
+  # Dilation schedule [1, 2] is the à trous equivalent of two extra stride-2
+  # layers after the strided frontend: at jump=4, d=1 reads 3 adjacent
+  # layer-2 frames (= a stride-2 layer's view) and d=2 stacked on top
+  # replicates the next stride-2 layer. Gives a dense 31-input-frame RF at
+  # the post-CNN (pre-pick) stage — same RF c16x has, applied here at the
+  # 25 Hz CTC tap. The pick of 8 then adds an additional 8× compression
+  # (no aggregation, just a slice) for the final 32× rate to the conformer.
+  #
   # Trailing FFN is intentionally absent in the cross-attn block (next
   # conformer layer's macaron half-step FFN already does that work).
   downsampler:
     type: cross_attn
     kwargs:
       strides: [[2, 2], [2, 2]]
+      dilations: [1, 2]
       stride: 8
       num_heads: 4
       num_layers: 2
@@ -89,7 +98,7 @@ train:
   adam_beta1: 0.9
   adam_beta2: 0.98
   adam_epsilon: 1.0e-8
-  max_grad_norm: 5.0
+  max_grad_norm: 1.0
   label_smoothing_factor: 0.1
   lr_scheduler_type: inverse_sqrt
   logging_steps: 10

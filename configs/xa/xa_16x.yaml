@@ -24,6 +24,15 @@ model:
   # the full post-frontend sequence to inject local temporal context. Net
   # frame rate to the conformer ≈6.25 Hz (16× total).
   #
+  # Dilation schedule [1, 2] is the à trous equivalent of c16x's remaining
+  # stride-2, stride-2 cascade after the strided frontend: at jump=4, a
+  # d=1 kernel reads 3 adjacent layer-2 frames (= what c16x layer 3 reads),
+  # and a d=2 kernel on top of that replicates layer 4. RF = 31 input
+  # frames after picking every 4th — exactly matches c16x's pure-stride
+  # stem with dense (no-gap) coverage. (Earlier default [2, 2] gave a
+  # 39-frame sparse RF with every-other-frame holes — wrong for replicating
+  # a stride cascade.)
+  #
   # Trailing FFN is intentionally absent in the cross-attn block: the next
   # conformer layer starts with a macaron half-step FFN, which redoes the
   # same per-token nonlinear processing on the same residual stream. Keeping
@@ -34,6 +43,7 @@ model:
     type: cross_attn
     kwargs:
       strides: [[2, 2], [2, 2]]
+      dilations: [1, 2]
       stride: 4
       num_heads: 4
       num_layers: 1

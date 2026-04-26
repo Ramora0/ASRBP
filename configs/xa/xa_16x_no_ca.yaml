@@ -18,18 +18,28 @@ model:
   n_mels: 80
   n_fft: 400
   hop_length: 160
-  # ABLATION CONFIG — same feature extractor as xa_16x.yaml (4-Conv2d stem
-  # with strided frontend [[2,2],[2,2]] + dilated [(d=2),(d=2)] preserving
-  # mel through every layer + final projection + strided pick of every 4th
-  # frame), but with `num_layers: 0` on the cross-attn block so cross-attn
-  # is fully disabled. Output of the downsampler is just the strided pick
-  # of the post-projection sequence — no attention refinement at all.
+  # ABLATION CONFIG — 4-Conv2d stem with strided frontend [[2,2],[2,2]] +
+  # dilated [(d=1),(d=2)] preserving mel through every layer + final
+  # projection + strided pick of every 4th frame, with `num_layers: 0` on
+  # the cross-attn block so cross-attn is fully disabled. Output of the
+  # downsampler is just the strided pick of the post-projection sequence —
+  # no attention refinement at all.
+  #
+  # Dilation schedule [1, 2] is the à trous equivalent of c16x's remaining
+  # stride-2, stride-2 cascade after the strided frontend: at jump=4, a
+  # d=1 kernel reads 3 adjacent layer-2 frames (= what c16x's stride-2
+  # layer 3 reads), and a d=2 kernel on top of that replicates layer 4.
+  # Result is a dense 7-layer-2-frame view (RF = 31 input frames after
+  # picking every 4th), mathematically equivalent to c16x's stem. The
+  # earlier [2, 2] dilation schedule didn't compound from 1, so it left
+  # gaps every other layer-2 frame and gave a 39-frame sparse RF instead.
   #
   # Used to isolate where any convergence slowdown vs c16x originates:
   #   - If this run trains as fast as c16x → slowdown was the cross-attn
   #     block (bootstrap of zero-init out_proj, etc.).
-  #   - If this run is also slow → slowdown is in the feature extractor
-  #     itself (dilated convs, larger projection, RF gaps, strided pick).
+  #   - If this run is also slow → slowdown is elsewhere (e.g. the
+  #     post-stack projection seeing T/4 frames before the strided pick,
+  #     or the strided pick itself vs. c16x's learned strided convs).
   #
   # Pair with configs/xa/xa_16x.yaml (full cross-attn) and configs/cnns/
   # c16x.yaml (pure conv baseline) for the three-way comparison.
@@ -37,7 +47,7 @@ model:
     type: cross_attn
     kwargs:
       strides: [[2, 2], [2, 2]]
-      dilations: [2, 2]
+      dilations: [1, 2]
       stride: 4
       num_layers: 0
   decoder_d_model: 256
@@ -82,7 +92,7 @@ train:
   adam_beta1: 0.9
   adam_beta2: 0.98
   adam_epsilon: 1.0e-8
-  max_grad_norm: 5.0
+  max_grad_norm: 1.0
   label_smoothing_factor: 0.1
   lr_scheduler_type: inverse_sqrt
   logging_steps: 10

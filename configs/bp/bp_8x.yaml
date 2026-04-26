@@ -78,7 +78,7 @@ train:
   adam_beta1: 0.9
   adam_beta2: 0.98
   adam_epsilon: 1.0e-8
-  max_grad_norm: 5.0
+  max_grad_norm: 1.0
   label_smoothing_factor: 0.1
   lr_scheduler_type: inverse_sqrt
   logging_steps: 10

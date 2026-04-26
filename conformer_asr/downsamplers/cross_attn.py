@@ -13,7 +13,11 @@ Pipeline inside ``forward``:
      downsampling is 16× (≈6.25 Hz on 100 Hz mels).
   3. ``num_layers`` pre-norm cross-attention blocks: queries = the picked
      subset (residually updated), keys/values = the full post-frontend
-     sequence. Padded post-frontend positions are masked out of attention.
+     sequence. RoPE is applied to Q/K with positions taken from the
+     **original post-frontend indices** — queries get ``[0, stride, 2*stride,
+     ...]``, keys get ``[0, 1, ..., T_cnn-1]`` — so the relative offset
+     under RoPE matches the true frame-rate gap. Padded post-frontend
+     positions are masked out of attention.
   4. Return the refined queries.
 
 Output length is a pure function of input length (frontend arithmetic +
@@ -32,12 +36,32 @@ from .base import Downsampler
 from .conv2d import Conv2dDownsampler
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    return torch.cat((-x[..., d:], x[..., :d]), dim=-1)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """GPT-NeoX-style RoPE: rotate first half against second half.
+
+    ``x``: ``(B, H, T, head_dim)``. ``cos``/``sin``: ``(1, 1, T, head_dim)``,
+    where the last-axis halves are duplicates of the same per-pair frequency
+    table — see ``_CrossAttnBlock._rope_cos_sin``.
+    """
+    return x * cos + _rotate_half(x) * sin
+
+
 class _CrossAttnBlock(nn.Module):
-    """Pre-norm cross-attention sublayer (no FFN).
+    """Pre-norm cross-attention sublayer with RoPE on Q/K (no FFN).
 
     The trailing position-wise FFN is omitted because the immediately-downstream
     Conformer layer starts with a macaron half-step FFN, which redoes the same
     work on the same residual stream.
+
+    RoPE positions are passed in by the caller so we can encode the *original*
+    post-frontend indices for both queries (``0, stride, ...``) and keys
+    (``0, 1, ..., T_cnn-1``). That makes the Q·K relative offset under RoPE
+    equal to the true frame-rate gap between a picked query and any key.
     """
 
     def __init__(
@@ -46,12 +70,16 @@ class _CrossAttnBlock(nn.Module):
         num_heads: int,
         dropout: float,
         attn_dropout: float,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         if hidden % num_heads != 0:
             raise ValueError(f"hidden={hidden} not divisible by num_heads={num_heads}")
+        head_dim = hidden // num_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim={head_dim} must be even for RoPE")
         self.num_heads = int(num_heads)
-        self.head_dim = hidden // num_heads
+        self.head_dim = head_dim
         self.attn_dropout = float(attn_dropout)
 
         self.norm_q = nn.LayerNorm(hidden)
@@ -62,10 +90,32 @@ class _CrossAttnBlock(nn.Module):
         self.out_proj = nn.Linear(hidden, hidden)
         self.resid_dropout = nn.Dropout(dropout)
 
+        # RoPE inverse-frequency table (held in fp32; cos/sin are computed on
+        # the fly per forward — the sequences here are short, so the cost is
+        # negligible vs. precomputing a max-length cache).
+        inv_freq = 1.0 / (
+            float(rope_base)
+            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _rope_cos_sin(
+        self, positions: torch.Tensor, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # positions: (T,) long, on device. Returns cos, sin of shape
+        # (1, 1, T, head_dim), matching dtype for the multiply against (B, H, T, head_dim).
+        freqs = positions.to(self.inv_freq.dtype)[:, None] * self.inv_freq[None, :]  # (T, head_dim/2)
+        emb = torch.cat([freqs, freqs], dim=-1)  # (T, head_dim) — halves duplicated for _rotate_half
+        cos = emb.cos().to(dtype)[None, None, :, :]
+        sin = emb.sin().to(dtype)[None, None, :, :]
+        return cos, sin
+
     def forward(
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
+        q_positions: torch.Tensor,
+        k_positions: torch.Tensor,
         attn_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         B, T_q, D = q.shape
@@ -77,6 +127,11 @@ class _CrossAttnBlock(nn.Module):
         Q = self.q_proj(q_n).view(B, T_q, self.num_heads, self.head_dim).transpose(1, 2)
         K = self.k_proj(kv_n).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
         V = self.v_proj(kv_n).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+
+        cos_q, sin_q = self._rope_cos_sin(q_positions, Q.dtype)
+        cos_k, sin_k = self._rope_cos_sin(k_positions, K.dtype)
+        Q = _apply_rope(Q, cos_q, sin_q)
+        K = _apply_rope(K, cos_k, sin_k)
 
         out = F.scaled_dot_product_attention(
             Q, K, V,
@@ -175,11 +230,20 @@ class CrossAttnDownsampler(Downsampler):
             valid = pos < post_lens.unsqueeze(1)  # (B, T_cnn)
             attn_mask = valid[:, None, None, :]  # (B, 1, 1, T_k); broadcasts over heads + queries
 
-        # 3. Pick every ``stride``-th frame as queries.
-        q = h[:, ::self.stride, :] if self.stride > 1 else h
+        # 3. Pick every ``stride``-th frame as queries. Track which post-frontend
+        # indices we picked — those are the RoPE positions for the queries, so
+        # the relative offset Q[i] - K[j] under RoPE matches the true gap
+        # between picked frame ``i*stride`` and key frame ``j``.
+        if self.stride > 1:
+            q = h[:, ::self.stride, :]
+            q_positions = torch.arange(0, T_cnn, self.stride, device=device)
+        else:
+            q = h
+            q_positions = torch.arange(T_cnn, device=device)
+        k_positions = torch.arange(T_cnn, device=device)
 
         # 4. Cross-attend (one or more blocks).
         for layer in self.layers:
-            q = layer(q, h, attn_mask)
+            q = layer(q, h, q_positions, k_positions, attn_mask)
 
         return q

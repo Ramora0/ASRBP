@@ -1,0 +1,185 @@
+"""Cross-attention downsampler.
+
+Conv2d frontend → pick every Nth post-frontend vector → cross-attend that
+subset to the full post-frontend sequence to inject temporal context, then
+hand the refined queries to the encoder.
+
+Pipeline inside ``forward``:
+  1. ``Conv2dDownsampler`` frontend bridges ``(B, T_mel, n_mels)`` to
+     ``(B, T_cnn, hidden)`` (default: 4× time reduction, matching c4x).
+  2. Pick ``out[:, ::stride, :]`` from the post-frontend sequence to seed
+     queries — these are the eventual encoder inputs after refinement.
+     With the default ``stride=4`` on top of the 4× conv stem, total
+     downsampling is 16× (≈6.25 Hz on 100 Hz mels).
+  3. ``num_layers`` pre-norm cross-attention blocks: queries = the picked
+     subset (residually updated), keys/values = the full post-frontend
+     sequence. Padded post-frontend positions are masked out of attention.
+  4. Return the refined queries.
+
+Output length is a pure function of input length (frontend arithmetic +
+ceil-divide by ``stride``) — this is a static downsampler. ``aux_loss``
+stays at the base-class default ``None``.
+"""
+from __future__ import annotations
+
+from typing import Sequence
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .base import Downsampler
+from .conv2d import Conv2dDownsampler
+
+
+class _CrossAttnBlock(nn.Module):
+    """Pre-norm cross-attention sublayer (no FFN).
+
+    The trailing position-wise FFN is omitted because the immediately-downstream
+    Conformer layer starts with a macaron half-step FFN, which redoes the same
+    work on the same residual stream.
+    """
+
+    def __init__(
+        self,
+        hidden: int,
+        num_heads: int,
+        dropout: float,
+        attn_dropout: float,
+    ):
+        super().__init__()
+        if hidden % num_heads != 0:
+            raise ValueError(f"hidden={hidden} not divisible by num_heads={num_heads}")
+        self.num_heads = int(num_heads)
+        self.head_dim = hidden // num_heads
+        self.attn_dropout = float(attn_dropout)
+
+        self.norm_q = nn.LayerNorm(hidden)
+        self.norm_kv = nn.LayerNorm(hidden)
+        self.q_proj = nn.Linear(hidden, hidden)
+        self.k_proj = nn.Linear(hidden, hidden)
+        self.v_proj = nn.Linear(hidden, hidden)
+        self.out_proj = nn.Linear(hidden, hidden)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        B, T_q, D = q.shape
+        T_k = kv.shape[1]
+
+        q_n = self.norm_q(q)
+        kv_n = self.norm_kv(kv)
+
+        Q = self.q_proj(q_n).view(B, T_q, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(kv_n).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(kv_n).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(
+            Q, K, V,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )
+        out = out.transpose(1, 2).reshape(B, T_q, D)
+        q = q + self.resid_dropout(self.out_proj(out))
+        return q
+
+
+class CrossAttnDownsampler(Downsampler):
+    """Conv2d frontend → strided pick → cross-attention refinement.
+
+    Args:
+        n_mels: Mel-bin count (passed straight through to the frontend).
+        hidden: Transformer hidden size (frontend output dim and cross-attn
+            dim).
+        dropout: Dropout after the frontend's projection AND on the
+            attention sublayer's residual branch.
+        strides: Per-layer ``[time, mel]`` strides for the frontend Conv2d
+            stack (same convention as ``Conv2dDownsampler``). Default
+            ``[[2,2],[2,2]]`` matches c4x — 4× time reduction.
+        stride: Subsample factor applied on top of the frontend. ``out[:,
+            ::stride, :]`` from the post-frontend sequence seeds the queries
+            for cross-attention. With the default ``stride=4`` on top of the
+            4× conv stem, total compression is 16×.
+        num_heads: Cross-attention heads.
+        num_layers: Number of cross-attention blocks. Each block re-attends
+            the (residually-updated) queries to the same key/value sequence.
+        attn_dropout: Dropout applied inside ``scaled_dot_product_attention``.
+    """
+
+    def __init__(
+        self,
+        n_mels: int,
+        hidden: int,
+        dropout: float = 0.0,
+        *,
+        strides: Sequence[Sequence[int]] = ((2, 2), (2, 2)),
+        stride: int = 4,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        attn_dropout: float = 0.0,
+    ):
+        super().__init__()
+        if stride < 1:
+            raise ValueError(f"stride must be >= 1, got {stride}")
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+        self.frontend = Conv2dDownsampler(
+            n_mels=n_mels, hidden=hidden, strides=strides, dropout=dropout
+        )
+        self.hidden = int(hidden)
+        self.stride = int(stride)
+
+        self.layers = nn.ModuleList([
+            _CrossAttnBlock(
+                hidden=int(hidden),
+                num_heads=int(num_heads),
+                dropout=float(dropout),
+                attn_dropout=float(attn_dropout),
+            )
+            for _ in range(int(num_layers))
+        ])
+
+    def output_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
+        """Frontend output lengths, then ceil-divide by ``stride``.
+
+        Picking ``out[:, ::stride, :]`` from a length-``L`` sequence yields
+        ``ceil(L / stride)`` elements; the same arithmetic gives the per-sample
+        valid count.
+        """
+        post = self.frontend.output_lengths(input_lengths)
+        if self.stride == 1:
+            return post
+        return torch.div(post + self.stride - 1, self.stride, rounding_mode="floor")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_lengths: torch.LongTensor | None = None,
+    ) -> torch.Tensor:
+        # 1. Conv2d frontend: (B, T_mel, n_mels) -> (B, T_cnn, hidden).
+        h = self.frontend(x)
+        B, T_cnn, _ = h.shape
+        device = h.device
+
+        # 2. Build a key-padding mask covering padded post-frontend positions.
+        # SDPA bool-mask convention: True = participates in attention.
+        attn_mask: torch.Tensor | None = None
+        if input_lengths is not None:
+            post_lens = self.frontend.output_lengths(input_lengths.to(device)).long()
+            post_lens = post_lens.clamp(min=1, max=T_cnn)
+            pos = torch.arange(T_cnn, device=device).unsqueeze(0)
+            valid = pos < post_lens.unsqueeze(1)  # (B, T_cnn)
+            attn_mask = valid[:, None, None, :]  # (B, 1, 1, T_k); broadcasts over heads + queries
+
+        # 3. Pick every ``stride``-th frame as queries.
+        q = h[:, ::self.stride, :] if self.stride > 1 else h
+
+        # 4. Cross-attend (one or more blocks).
+        for layer in self.layers:
+            q = layer(q, h, attn_mask)
+
+        return q

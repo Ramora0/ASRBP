@@ -44,6 +44,16 @@ class ConformerAEDWithCTCOutput(Seq2SeqLMOutput):
     ctc_loss: Optional[torch.FloatTensor] = None
     ctc_logits: Optional[torch.FloatTensor] = None
     encoder_attention_mask: Optional[torch.Tensor] = None
+    # Bool mask whose time-axis length matches ``ctc_logits`` (which can
+    # diverge from ``encoder_attention_mask`` when ``ctc_input='post_cnn'`` —
+    # CTC then runs at the pre-pick rate). For ``ctc_input`` in
+    # ``("encoder", "features")`` this aliases ``encoder_attention_mask``.
+    ctc_attention_mask: Optional[torch.Tensor] = None
+    # (B,) bool — ``True`` for samples where the CTC alignment is feasible
+    # (i.e. ``input_length >= label_length + n_consecutive_dup_pairs``). At
+    # high downsample rates / short inputs this can drop well below 1; the
+    # trainer rolls it up into ``train/ctc_viable_pct``.
+    ctc_viable: Optional[torch.Tensor] = None
 
 
 class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
@@ -64,6 +74,7 @@ class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
         decoder=None,
         ctc_weight: float = 0.3,
         ctc_blank_id: int = 0,
+        ctc_input: str = "encoder",
     ):
         super().__init__(config=config, encoder=encoder, decoder=decoder)
         vocab_size = self.decoder.config.vocab_size
@@ -71,17 +82,33 @@ class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
         self.ctc_head = nn.Linear(hidden_size, vocab_size)
         self.ctc_weight = float(ctc_weight)
         self.ctc_blank_id = int(ctc_blank_id)
+        if ctc_input not in ("encoder", "features", "post_cnn"):
+            raise ValueError(
+                f"ctc_input must be 'encoder', 'features', or 'post_cnn', "
+                f"got {ctc_input!r}"
+            )
+        self.ctc_input = ctc_input
         # Persist on the config so save_pretrained / from_pretrained round-trip
         # the CTC knobs without needing a custom config class.
         self.config.ctc_weight = self.ctc_weight
         self.config.ctc_blank_id = self.ctc_blank_id
+        self.config.ctc_input = self.ctc_input
 
     def _compute_ctc_loss(
         self,
         ctc_logits: torch.Tensor,
         encoder_attn_mask: Optional[torch.Tensor],
         labels: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(loss, viable_mask)``.
+
+        ``viable_mask`` is a per-sample bool tensor (``True`` = the input is
+        long enough that CTC can produce a finite alignment). Required input
+        length is ``L + D`` where ``L = len(target)`` and ``D`` is the count
+        of consecutive duplicate label tokens (CTC inserts a mandatory blank
+        between repeats). With ``zero_infinity=True`` non-viable samples
+        contribute zero loss but also no gradient — they're dead weight.
+        """
         # (B, T, V) -> (T, B, V) log-probs. Cast to fp32: CTC's log-sum-exp
         # is unstable under fp16/bf16, and cuDNN's CTC kernel silently falls
         # back to CPU if fed half-precision.
@@ -103,7 +130,19 @@ class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
         label_lengths = label_mask.sum(-1).long()
         flat_targets = labels.masked_select(label_mask).long()
 
-        return F.ctc_loss(
+        # Per-sample viability. Count consecutive-duplicate label pairs (which
+        # each force an extra blank in any valid CTC alignment), then check
+        # input_length >= label_length + n_dup. Pad slots are excluded by
+        # gating both positions on label_mask.
+        if labels.size(1) > 1:
+            both_valid = label_mask[:, 1:] & label_mask[:, :-1]
+            consec_eq = labels[:, 1:].eq(labels[:, :-1]) & both_valid
+            n_dup = consec_eq.sum(-1).long()
+        else:
+            n_dup = torch.zeros_like(label_lengths)
+        viable_mask = input_lengths >= (label_lengths + n_dup)
+
+        loss = F.ctc_loss(
             log_probs,
             flat_targets,
             input_lengths,
@@ -112,6 +151,7 @@ class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
             reduction="mean",
             zero_infinity=True,
         )
+        return loss, viable_mask
 
     def forward(
         self,
@@ -171,18 +211,72 @@ class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
 
         # CTC head. Skip during ``generate``'s incremental decoder steps (when
         # encoder_outputs was cached and no labels are requested) — the head
-        # would just produce unused logits step after step.
+        # would just produce unused logits step after step. ``ctc_input`` picks
+        # the source:
+        #   - "encoder"  : post-Conformer hidden states (full encoder gradient)
+        #   - "features" : post-downsampler tensor (gradient stops at the conv
+        #                  stem; same time dim as encoder so masks line up)
+        #   - "post_cnn" : intermediate post-CNN tensor inside a cross-attn /
+        #                  pooling downsampler — at the higher pre-pick rate,
+        #                  so we also have to build a *different* attention
+        #                  mask for CTC.
         ctc_logits = None
         ctc_loss = None
+        ctc_viable = None
+        ctc_attn_mask = None
         if encoder_was_run_here or labels is not None:
-            ctc_logits = self.ctc_head(encoder_hidden)
+            if self.ctc_input == "features":
+                ctc_source = getattr(self.encoder, "_features_for_ctc", None)
+                if ctc_source is None:
+                    raise RuntimeError(
+                        "ctc_input='features' but encoder did not stash "
+                        "'_features_for_ctc'. Encoder must run before the "
+                        "CTC head."
+                    )
+                ctc_attn_mask = encoder_attn_mask
+            elif self.ctc_input == "post_cnn":
+                ctc_source = getattr(
+                    self.encoder.downsampler, "_post_cnn_features", None
+                )
+                if ctc_source is None:
+                    raise RuntimeError(
+                        "ctc_input='post_cnn' but downsampler did not stash "
+                        "'_post_cnn_features'. The downsampler must run "
+                        "before the CTC head and must expose this tap "
+                        "(currently: cross_attn)."
+                    )
+                if attention_mask is not None:
+                    ctc_attn_mask = self.encoder._get_post_cnn_attention_mask(
+                        ctc_source.size(1), attention_mask
+                    )
+                else:
+                    ctc_attn_mask = None
+            else:
+                ctc_source = encoder_hidden
+                ctc_attn_mask = encoder_attn_mask
+            ctc_logits = self.ctc_head(ctc_source)
             if labels is not None:
-                ctc_loss = self._compute_ctc_loss(ctc_logits, encoder_attn_mask, labels)
+                ctc_loss, ctc_viable = self._compute_ctc_loss(
+                    ctc_logits, ctc_attn_mask, labels
+                )
 
         if aed_loss is not None and ctc_loss is not None:
             total_loss = (1.0 - self.ctc_weight) * aed_loss + self.ctc_weight * ctc_loss
         else:
             total_loss = aed_loss
+
+        # Dynamic downsamplers (e.g. boundary predictor) carry an auxiliary
+        # loss alongside their pooled output. The loss is computed during the
+        # encoder's forward and stashed on the downsampler; we read it here
+        # and fold it into the training total. ``aux_loss`` returns ``None``
+        # for static downsamplers (default) and outside training, so this is
+        # a no-op in those cases.
+        downsampler = getattr(self.encoder, "downsampler", None)
+        aux_loss_fn = getattr(downsampler, "aux_loss", None) if downsampler is not None else None
+        if total_loss is not None and aux_loss_fn is not None:
+            aux = aux_loss_fn()
+            if aux is not None:
+                total_loss = total_loss + aux.to(total_loss.dtype)
 
         output = ConformerAEDWithCTCOutput(
             loss=total_loss,
@@ -198,6 +292,8 @@ class ConformerAEDWithCTC(SpeechEncoderDecoderModel):
             ctc_loss=ctc_loss,
             ctc_logits=ctc_logits,
             encoder_attention_mask=encoder_attn_mask,
+            ctc_attention_mask=ctc_attn_mask if ctc_logits is not None else None,
+            ctc_viable=ctc_viable,
         )
         return output if return_dict else output.to_tuple()
 
@@ -232,6 +328,7 @@ def build_model(mcfg: ModelConfig, tokenizer: PreTrainedTokenizerFast) -> Speech
             decoder=decoder,
             ctc_weight=mcfg.ctc_weight,
             ctc_blank_id=pad_id,
+            ctc_input=getattr(mcfg, "ctc_input", "encoder"),
         )
     else:
         model = SpeechEncoderDecoderModel(encoder=encoder, decoder=decoder)

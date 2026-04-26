@@ -1,0 +1,113 @@
+model:
+  # Architecture selectors — see conformer_asr/{encoders,decoders}/__init__.py
+  # for the registered options.
+  encoder_type: conformer
+  decoder_type: bart
+  # Conformer-M sized to match configs/cnns/c4x.yaml so the cross-attn run is
+  # a like-for-like comparison vs. the static 4× stem (and a 2× coarser
+  # frame rate downstream — encoder ops drop accordingly).
+  encoder_hidden_size: 256
+  encoder_num_hidden_layers: 16
+  encoder_num_attention_heads: 4
+  encoder_intermediate_size: 1024
+  encoder_conv_depthwise_kernel_size: 31
+  encoder_hidden_dropout: 0.05
+  encoder_attention_dropout: 0.05
+  encoder_activation_dropout: 0.05
+  encoder_layerdrop: 0.1
+  n_mels: 80
+  n_fft: 400
+  hop_length: 160
+  # ABLATION CONFIG — same feature extractor as xa_16x.yaml (4-Conv2d stem
+  # with strided frontend [[2,2],[2,2]] + dilated [(d=2),(d=2)] preserving
+  # mel through every layer + final projection + strided pick of every 4th
+  # frame), but with `num_layers: 0` on the cross-attn block so cross-attn
+  # is fully disabled. Output of the downsampler is just the strided pick
+  # of the post-projection sequence — no attention refinement at all.
+  #
+  # Used to isolate where any convergence slowdown vs c16x originates:
+  #   - If this run trains as fast as c16x → slowdown was the cross-attn
+  #     block (bootstrap of zero-init out_proj, etc.).
+  #   - If this run is also slow → slowdown is in the feature extractor
+  #     itself (dilated convs, larger projection, RF gaps, strided pick).
+  #
+  # Pair with configs/xa/xa_16x.yaml (full cross-attn) and configs/cnns/
+  # c16x.yaml (pure conv baseline) for the three-way comparison.
+  downsampler:
+    type: cross_attn
+    kwargs:
+      strides: [[2, 2], [2, 2]]
+      dilations: [2, 2]
+      stride: 4
+      num_layers: 0
+  decoder_d_model: 256
+  decoder_layers: 4
+  decoder_attention_heads: 4
+  decoder_ffn_dim: 1024
+  decoder_dropout: 0.05
+  decoder_max_position_embeddings: 448
+  ctc_enabled: true
+  ctc_weight: 0.3
+  input_normalize_freeze_epochs: 4
+  spec_aug_time_masks: 4
+  spec_aug_time_length_low: 15
+  spec_aug_time_length_high: 25
+  spec_aug_feature_masks: 4
+  spec_aug_feature_length_low: 10
+  spec_aug_feature_length_high: 15
+  spec_aug_warmup_steps: 1000
+
+data:
+  dataset_id: openslr/librispeech_asr
+  subset: all960
+  eval_split: validation.clean
+  test_split: test.clean
+  sampling_rate: 16000
+  max_audio_seconds: 20.0
+  speed_perturbations: [0.9, 1.0, 1.1]
+  num_proc: 0
+  tokenizer_dir: null
+  cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache
+
+train:
+  output_dir: outputs/run-xa-16x-no-ca
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 8
+  effective_batch_size: 256
+  gradient_accumulation_steps: 0
+  learning_rate: 1.0e-3
+  warmup_steps: 2500
+  num_train_epochs: 30.0
+  weight_decay: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 5.0
+  label_smoothing_factor: 0.1
+  lr_scheduler_type: inverse_sqrt
+  logging_steps: 10
+  save_total_limit: 3
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  group_by_length: true
+  dataloader_num_workers: 8
+  dataloader_prefetch_factor: 4
+  report_to: wandb
+  seed: 42
+  generation_max_length: 300
+  generation_num_beams: 1
+  swa_enabled: true
+  swa_start_frac: 0.75
+
+wandb:
+  enabled: true
+  project: conformer-asr-librispeech
+  entity: null
+  run_name: conformer-xa-16x-no-ca
+  group: null
+  tags: ["ablation", "no-cross-attn"]
+  notes: "Ablation: xa_16x feature extractor with cross-attn disabled (num_layers=0). Isolates whether convergence slowdown vs c16x is in the feature extractor or the cross-attn block."
+  watch_model: false
+  log_preds_table: true
+  log_preds_n: 16

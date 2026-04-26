@@ -91,7 +91,7 @@ def main() -> None:
 
     tokenizer = _make_dummy_tokenizer()
 
-    mcfg = load_config(Path(__file__).resolve().parent.parent / "configs/conformer_small.yaml").model
+    mcfg = load_config(Path(__file__).resolve().parent.parent / "configs/cnns/c4x.yaml").model
     model = build_model(mcfg, tokenizer)
 
     train_ds = _make_fake_dataset(4, tokenizer, mcfg)

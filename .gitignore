@@ -64,6 +64,7 @@ ipython_config.py
 .python-version
 .venv
 .v100/
+.a100/
 venv/
 env/
 ENV/

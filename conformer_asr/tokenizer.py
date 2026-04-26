@@ -75,7 +75,13 @@ class SpeechBrainTokenizer:
         return BatchEncoding({"input_ids": ids})
 
     def _strip_special(self, ids: Sequence[int]) -> list[int]:
-        specials = {self.pad_token_id, self.bos_token_id, self.eos_token_id, self.unk_token_id}
+        # NOTE: ``unk_token_id`` is intentionally *not* stripped. This
+        # SentencePiece vocab's id 3 is ``▁THE`` (the word "THE"), not the SP
+        # ``<unk>`` piece (which lives at id 0 here). Stripping id 3 silently
+        # deletes every "THE"/"A" from decoded text for both predictions and
+        # references, masking the model's real WER. sp.decode already renders
+        # a genuine ``<unk>`` (id 0) as an empty string, so that case is safe.
+        specials = {self.pad_token_id, self.bos_token_id, self.eos_token_id}
         out: list[int] = []
         for i in ids:
             i = int(i)

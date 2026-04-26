@@ -325,6 +325,8 @@ class CTCEvalCallback(TrainerCallback):
         # (otherwise short-audio batches would be under-weighted vs long ones).
         ctc_loss_sum = 0.0
         ctc_loss_frames = 0
+        ctc_viable_count = 0
+        ctc_viable_total = 0
 
         use_autocast = (
             device.type == "cuda"
@@ -364,13 +366,25 @@ class CTCEvalCallback(TrainerCallback):
                         )
 
                     ctc_logits = outputs.ctc_logits
-                    enc_mask = outputs.encoder_attention_mask
-                    input_lengths = enc_mask.sum(-1).long() if enc_mask is not None else None
+                    # Prefer ``ctc_attention_mask`` so the CTC time dim
+                    # matches the logits even when ``ctc_input='post_cnn'``
+                    # (where the encoder mask is at a *different* rate). Falls
+                    # back to encoder_attention_mask for older checkpoints.
+                    # Explicit ``is None`` check — ``a or b`` would call
+                    # ``bool(a)`` on the tensor and raise.
+                    ctc_mask = getattr(outputs, "ctc_attention_mask", None)
+                    if ctc_mask is None:
+                        ctc_mask = outputs.encoder_attention_mask
+                    input_lengths = ctc_mask.sum(-1).long() if ctc_mask is not None else None
                     batch_frames = int(input_lengths.sum().item()) if input_lengths is not None else ctc_logits.size(1) * ctc_logits.size(0)
 
                     if outputs.ctc_loss is not None and batch_frames > 0:
                         ctc_loss_sum += float(outputs.ctc_loss.detach().float().item()) * batch_frames
                         ctc_loss_frames += batch_frames
+
+                    if outputs.ctc_viable is not None:
+                        ctc_viable_count += int(outputs.ctc_viable.sum().item())
+                        ctc_viable_total += int(outputs.ctc_viable.numel())
 
                     pred_ids = ctc_greedy_decode(
                         ctc_logits.float(),
@@ -390,11 +404,16 @@ class CTCEvalCallback(TrainerCallback):
 
         wer = compute_wer(preds_all, refs_all)
         ctc_loss_mean = (ctc_loss_sum / ctc_loss_frames) if ctc_loss_frames > 0 else None
+        ctc_viable_pct = (
+            ctc_viable_count / float(ctc_viable_total) if ctc_viable_total > 0 else None
+        )
 
         if metrics is not None:
             metrics["eval/ctc_wer"] = float(wer)
             if ctc_loss_mean is not None:
                 metrics["eval/ctc_loss"] = float(ctc_loss_mean)
+            if ctc_viable_pct is not None:
+                metrics["eval/ctc_viable_pct"] = float(ctc_viable_pct)
 
         wandb = self._ensure_wandb()
         if wandb is not None:
@@ -405,11 +424,16 @@ class CTCEvalCallback(TrainerCallback):
             }
             if ctc_loss_mean is not None:
                 payload["eval/ctc_loss"] = float(ctc_loss_mean)
+            if ctc_viable_pct is not None:
+                payload["eval/ctc_viable_pct"] = float(ctc_viable_pct)
             wandb.log(payload, step=state.global_step)
         loss_str = f" ctc_loss={ctc_loss_mean:.4f}" if ctc_loss_mean is not None else ""
+        viable_str = (
+            f" ctc_viable_pct={ctc_viable_pct:.4f}" if ctc_viable_pct is not None else ""
+        )
         print(
             f"[ctc-eval] step={state.global_step} epoch={state.epoch} "
-            f"ctc_wer={wer:.4f}{loss_str}"
+            f"ctc_wer={wer:.4f}{loss_str}{viable_str}"
         )
 
 
@@ -496,7 +520,15 @@ class SWACallback(TrainerCallback):
             return
         self.save_dir.mkdir(parents=True, exist_ok=True)
         state_dict = self.swa_model.module.state_dict()
-        torch.save(state_dict, self.save_dir / "pytorch_model.bin")
+        # Save as safetensors to match the format ``trainer.save_model`` writes
+        # for ``final/``, so evaluate.py's safetensors-first loader picks it up
+        # and the two checkpoint dirs are interchangeable. Tie-shared tensors
+        # (e.g. ``decoder.lm_head.weight`` ↔ embedding) must share storage or
+        # ``save_file`` refuses; make each a contiguous clone.
+        from safetensors.torch import save_file
+
+        state_dict = {k: v.detach().contiguous().clone() for k, v in state_dict.items()}
+        save_file(state_dict, str(self.save_dir / "model.safetensors"))
         with open(self.save_dir / "swa_info.json", "w") as f:
             json.dump(
                 {
@@ -509,5 +541,5 @@ class SWACallback(TrainerCallback):
             )
         print(
             f"[swa] wrote {self._updates}-epoch-averaged weights to "
-            f"{self.save_dir}/pytorch_model.bin"
+            f"{self.save_dir}/model.safetensors"
         )

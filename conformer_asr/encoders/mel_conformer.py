@@ -58,6 +58,11 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         self.encoder = Wav2Vec2ConformerEncoder(config)
 
         self.post_init()
+        # post_init() recurses ``_init_weights`` over every submodule, which
+        # silently overwrites any custom parameter init the downsampler did
+        # in its own __init__ (e.g. biasing the boundary predictor toward a
+        # target prior). Give the downsampler a chance to restore it.
+        self.downsampler.post_parent_init()
 
     def _get_feature_vector_attention_mask(
         self,
@@ -80,6 +85,30 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         arange = torch.arange(feature_vector_length, device=attention_mask.device)
         return arange[None, :] < output_lengths[:, None]
 
+    def _get_post_cnn_attention_mask(
+        self,
+        post_cnn_length: int,
+        attention_mask: torch.LongTensor,
+    ) -> torch.BoolTensor:
+        """Bool mask for the **post-CNN / pre-pick** stage of the downsampler.
+
+        Used when an outer CTC head taps the downsampler before its picking
+        / pooling stage (``ctc_input='post_cnn'``). The downsampler must
+        expose ``post_cnn_lengths(input_lengths)``; only ``CrossAttnDownsampler``
+        does so today.
+        """
+        if not hasattr(self.downsampler, "post_cnn_lengths"):
+            raise RuntimeError(
+                f"downsampler {type(self.downsampler).__name__} does not "
+                "expose 'post_cnn_lengths'; ctc_input='post_cnn' is only "
+                "supported with downsamplers that have a non-CNN compression "
+                "stage (e.g. cross_attn)."
+            )
+        input_lengths = attention_mask.sum(-1)
+        post_cnn_lens = self.downsampler.post_cnn_lengths(input_lengths)
+        arange = torch.arange(post_cnn_length, device=attention_mask.device)
+        return arange[None, :] < post_cnn_lens[:, None]
+
     def forward(
         self,
         input_features: torch.FloatTensor,
@@ -98,8 +127,18 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         x = self.spec_augment(x, attention_mask=attention_mask)
 
         # 3. Downsampler stem: (B, T_mel, n_mels) → (B, T', hidden).
-        x = self.downsampler(x)
+        # Dynamic downsamplers (e.g. boundary predictor) need per-sample valid
+        # lengths to mask padding before pooling — pass them through; static
+        # downsamplers ignore the kwarg.
+        input_lengths = attention_mask.sum(-1) if attention_mask is not None else None
+        x = self.downsampler(x, input_lengths=input_lengths)
         t_out = x.shape[1]
+
+        # Stash the post-downsampler tensor so an outer wrapper (e.g.
+        # ``ConformerAEDWithCTC`` with ``ctc_input="features"``) can attach a
+        # head to the conv-stem output without re-running it. Plain attribute
+        # (not a buffer/parameter) so it stays out of state_dict.
+        self._features_for_ctc = x
 
         # Downsample the pre-stem attention mask so the Conformer blocks see
         # the correct (B, T') mask for self-attention.

@@ -32,6 +32,7 @@ consumed by the rest of the model:
 """
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import torch
@@ -121,6 +122,16 @@ class BoundaryPredictorDownsampler(Downsampler):
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
+        # Start the boundary predictor at exactly `prior` regardless of the
+        # frontend's init scale: zero the final weight and set the bias to
+        # logit(prior), so every per-frame logit is `bias` at step 0 and
+        # sigmoid(bias) == prior. Bias-only init would only hit prior on
+        # average — the realized rate would drift with the variance of the
+        # frontend's output. Single output unit ⇒ no symmetry issue.
+        with torch.no_grad():
+            p = min(max(self.prior, 1e-4), 1 - 1e-4)
+            self.boundary_mlp[-1].weight.zero_()
+            self.boundary_mlp[-1].bias.fill_(math.log(p / (1.0 - p)))
         self.mlp_dropout = nn.Dropout(p=mlp_dropout)
 
         self._cached_lengths: torch.LongTensor | None = None

@@ -274,6 +274,11 @@ def main() -> None:
 
     preds_all: list[str] = []
     refs_all: list[str] = []
+    # BP empirical compression. Stays at 0 for static downsamplers (no
+    # ``last_stats``); only meaningful when the encoder uses a BP downsampler.
+    bp_n_boundaries = 0
+    bp_n_post_frontend = 0
+    bp_n_input = 0
 
     autocast_dtype = _autocast_dtype(cfg.train) if device == "cuda" else torch.float32
     use_autocast = device == "cuda" and autocast_dtype != torch.float32
@@ -335,6 +340,19 @@ def main() -> None:
                     repetition_penalty=args.repetition_penalty,
                 )
                 ac_scores = None
+
+        # Boundary-predictor compression bookkeeping. Tally per batch so the
+        # final eval result records the empirical compression rate the model
+        # actually produced over this checkpoint+split — independent of the
+        # ``prior`` configured at training time.
+        bp_stats_fn = getattr(getattr(model, "encoder", None), "downsampler", None)
+        bp_stats_fn = getattr(bp_stats_fn, "last_stats", None) if bp_stats_fn is not None else None
+        if bp_stats_fn is not None:
+            stats = bp_stats_fn()
+            if stats is not None:
+                bp_n_boundaries += stats["n_boundaries"]
+                bp_n_post_frontend += stats["n_post_frontend"]
+                bp_n_input += stats["n_input"]
 
         if rescore:
             bsz = len(audios)
@@ -435,7 +453,7 @@ def main() -> None:
 
     # Gather per-rank shards onto rank 0 for a single WER computation over the
     # concatenated lists (mean-of-per-shard WERs would be wrong — WER is a
-    # global ratio of edit distance to total reference length, δεν an average).
+    # global ratio of edit distance to total reference length, not an average).
     # ``all_gather_object`` pickles the lists through a CUDA ByteTensor under
     # NCCL, so every rank must have its device set (done above).
     if distributed:
@@ -445,9 +463,20 @@ def main() -> None:
         gathered_refs: list[list[str]] = [[] for _ in range(world_size)]
         dist.all_gather_object(gathered_preds, preds_all)
         dist.all_gather_object(gathered_refs, refs_all)
+        # Sum BP tallies across ranks so the empirical compression rate is
+        # computed over the full eval set, not per-rank shards.
+        bp_tally = torch.tensor(
+            [bp_n_boundaries, bp_n_post_frontend, bp_n_input],
+            dtype=torch.long,
+            device=device,
+        )
+        dist.all_reduce(bp_tally, op=dist.ReduceOp.SUM)
         if is_main:
             preds_all = [p for shard in gathered_preds for p in shard]
             refs_all = [r for shard in gathered_refs for r in shard]
+            bp_n_boundaries = int(bp_tally[0].item())
+            bp_n_post_frontend = int(bp_tally[1].item())
+            bp_n_input = int(bp_tally[2].item())
 
     if not is_main:
         dist.destroy_process_group()
@@ -468,6 +497,16 @@ def main() -> None:
         "num_samples": len(preds_all),
         "wer": float(score),
     }
+    if bp_n_post_frontend > 0:
+        # Realized boundary rate after the BP downsampler's Conv2d frontend
+        # ⇒ direct comparison against the configured ``prior``. ``compression``
+        # is its reciprocal (post-frontend frames per output frame), and
+        # ``total_compression`` extends to the raw mel rate (input frames per
+        # output frame) — the end-to-end multiplier the encoder actually saw.
+        result["bp_realized_prior"] = bp_n_boundaries / float(bp_n_post_frontend)
+        result["bp_compression"] = bp_n_post_frontend / max(1, bp_n_boundaries)
+        if bp_n_input > 0:
+            result["bp_total_compression"] = bp_n_input / max(1, bp_n_boundaries)
     out_path = Path(args.output_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():

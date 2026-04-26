@@ -483,6 +483,13 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
     ``train/bp_realized_prior``, ``train/bp_compression`` (post-frontend),
     and ``train/bp_total_compression`` (mel → post-BP). Static downsamplers
     have no ``last_stats()`` so these keys simply don't appear.
+
+    The same accumulators run during evaluation (driven by ``prediction_step``
+    rather than ``compute_loss``), so the empirical compression at eval time
+    is surfaced as ``eval/bp_realized_prior`` / ``eval/bp_compression`` /
+    ``eval/bp_total_compression``. Eval-mode forwards in
+    ``BoundaryPredictorDownsampler`` skip the binomial loss, so
+    ``eval/bp_aux_loss`` is intentionally not emitted.
     """
 
     def __init__(self, *args, **kwargs):
@@ -495,6 +502,11 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._bp_n_post_frontend = 0
         self._bp_n_input = 0
         self._bp_step_count = 0
+        # Eval-time BP accumulators. Reset on every ``evaluate()`` call so the
+        # numbers come out per-eval rather than rolling across the whole run.
+        self._eval_bp_n_boundaries = 0
+        self._eval_bp_n_post_frontend = 0
+        self._eval_bp_n_input = 0
 
     def compute_loss(
         self,
@@ -553,6 +565,41 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
 
         return (loss, outputs) if return_outputs else loss
 
+    def _accumulate_eval_bp_stats(self, model) -> None:
+        """Read ``last_stats()`` off the model's downsampler and add to the
+        eval-time accumulators. No-op for downsamplers without ``last_stats``.
+        """
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        downsampler = getattr(getattr(unwrapped, "encoder", None), "downsampler", None)
+        last_stats_fn = getattr(downsampler, "last_stats", None) if downsampler is not None else None
+        if last_stats_fn is None:
+            return
+        stats = last_stats_fn()
+        if stats is None:
+            return
+        self._eval_bp_n_boundaries += stats["n_boundaries"]
+        self._eval_bp_n_post_frontend += stats["n_post_frontend"]
+        self._eval_bp_n_input += stats["n_input"]
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # Eval driver: ``Seq2SeqTrainer.prediction_step`` runs the encoder via
+        # ``generate()`` first (then any prediction-loss forward). We tap the
+        # downsampler cache after super returns — by that point the most-recent
+        # encoder forward has populated ``last_stats()`` for this batch.
+        result = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+        self._accumulate_eval_bp_stats(model)
+        return result
+
+    def evaluate(self, *args, **kwargs):
+        # Reset eval accumulators at the *start* of every evaluate() call so the
+        # numbers reflect this eval pass and don't bleed across epoch boundaries.
+        self._eval_bp_n_boundaries = 0
+        self._eval_bp_n_post_frontend = 0
+        self._eval_bp_n_input = 0
+        return super().evaluate(*args, **kwargs)
+
     def log(self, logs, *args, **kwargs):
         # HF fires ``log()`` for both training (``loss`` key) and eval
         # (``eval_loss`` key). Only inject / reset on training log boundaries —
@@ -582,6 +629,21 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                 self._bp_n_post_frontend = 0
                 self._bp_n_input = 0
                 self._bp_step_count = 0
+        # Eval log boundary — emit empirical compression rate over the eval set.
+        # The downsampler's eval-mode forward zeros out the binomial loss, so
+        # there's no ``eval/bp_aux_loss`` companion key — only the realized rate
+        # / compression are meaningful at eval time.
+        if "eval_loss" in logs and self._eval_bp_n_post_frontend > 0:
+            logs["eval/bp_realized_prior"] = (
+                self._eval_bp_n_boundaries / float(self._eval_bp_n_post_frontend)
+            )
+            logs["eval/bp_compression"] = (
+                self._eval_bp_n_post_frontend / max(1, self._eval_bp_n_boundaries)
+            )
+            if self._eval_bp_n_input > 0:
+                logs["eval/bp_total_compression"] = (
+                    self._eval_bp_n_input / max(1, self._eval_bp_n_boundaries)
+                )
         return super().log(logs, *args, **kwargs)
 
 

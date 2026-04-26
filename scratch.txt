@@ -2,4 +2,9 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=4 scripts/train.py --config configs/cnns/c8x.yaml
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=4 scripts/train.py --config configs/cnns/c16x.yaml
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=2 scripts/train.py --config configs/bp/bp_8x.yaml
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=4 scripts/train.py --config configs/cnns/c2x_whisper.yaml --resume_from_checkpoint outputs/run-c2x-whisper/checkpoint-2
+
+python scripts/train.py --config configs/bp/bp_8x.yaml --resume_from_checkpoint outputs/run-bp-8x/checkpoint-1 
 python scripts/evaluate.py --checkpoint outputs/run/checkpoint-6594 --num_beams 10

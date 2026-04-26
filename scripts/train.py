@@ -475,6 +475,14 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
     Also tracks per-step AED / CTC loss sums so they can be surfaced as
     ``train/aed_loss`` and ``train/ctc_loss`` on the next ``log()`` boundary,
     mirroring how HF's built-in ``tr_loss`` accumulator drives ``train/loss``.
+
+    When the encoder uses a boundary-predictor downsampler (or any downsampler
+    that exposes ``last_stats()``), the trainer also accumulates the BP
+    auxiliary loss + realized boundary-rate / compression metrics across
+    the logging window and emits them as ``train/bp_aux_loss``,
+    ``train/bp_realized_prior``, ``train/bp_compression`` (post-frontend),
+    and ``train/bp_total_compression`` (mel → post-BP). Static downsamplers
+    have no ``last_stats()`` so these keys simply don't appear.
     """
 
     def __init__(self, *args, **kwargs):
@@ -482,6 +490,11 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._aed_loss_sum = 0.0
         self._ctc_loss_sum = 0.0
         self._loss_component_count = 0
+        self._bp_aux_loss_sum = 0.0
+        self._bp_n_boundaries = 0
+        self._bp_n_post_frontend = 0
+        self._bp_n_input = 0
+        self._bp_step_count = 0
 
     def compute_loss(
         self,
@@ -522,6 +535,22 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
             self._ctc_loss_sum += float(ctc_loss.detach().float().item())
         self._loss_component_count += 1
 
+        # Boundary-predictor stats. Any downsampler that exposes
+        # ``last_stats()`` gets its aux loss + realized rate / compression
+        # rolled into the logging window. Static downsamplers (no
+        # ``last_stats``) skip this block silently.
+        downsampler = getattr(unwrapped.encoder, "downsampler", None)
+        last_stats_fn = getattr(downsampler, "last_stats", None) if downsampler is not None else None
+        if last_stats_fn is not None:
+            stats = last_stats_fn()
+            if stats is not None:
+                if stats["aux_loss"] is not None:
+                    self._bp_aux_loss_sum += stats["aux_loss"]
+                self._bp_n_boundaries += stats["n_boundaries"]
+                self._bp_n_post_frontend += stats["n_post_frontend"]
+                self._bp_n_input += stats["n_input"]
+                self._bp_step_count += 1
+
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, *args, **kwargs):
@@ -535,6 +564,24 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
             self._aed_loss_sum = 0.0
             self._ctc_loss_sum = 0.0
             self._loss_component_count = 0
+            if self._bp_step_count > 0:
+                logs["train/bp_aux_loss"] = self._bp_aux_loss_sum / float(self._bp_step_count)
+                if self._bp_n_post_frontend > 0:
+                    logs["train/bp_realized_prior"] = (
+                        self._bp_n_boundaries / float(self._bp_n_post_frontend)
+                    )
+                    logs["train/bp_compression"] = (
+                        self._bp_n_post_frontend / max(1, self._bp_n_boundaries)
+                    )
+                if self._bp_n_input > 0:
+                    logs["train/bp_total_compression"] = (
+                        self._bp_n_input / max(1, self._bp_n_boundaries)
+                    )
+                self._bp_aux_loss_sum = 0.0
+                self._bp_n_boundaries = 0
+                self._bp_n_post_frontend = 0
+                self._bp_n_input = 0
+                self._bp_step_count = 0
         return super().log(logs, *args, **kwargs)
 
 

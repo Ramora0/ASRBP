@@ -125,11 +125,46 @@ class BoundaryPredictorDownsampler(Downsampler):
 
         self._cached_lengths: torch.LongTensor | None = None
         self._cached_aux_loss: torch.Tensor | None = None
+        self._cached_post_frontend_lens: torch.LongTensor | None = None
+        self._cached_input_lengths: torch.LongTensor | None = None
 
     # ------------------------------------------------------------- public API
 
     def aux_loss(self) -> torch.Tensor | None:
         return self._cached_aux_loss
+
+    def last_stats(self) -> dict | None:
+        """Boundary-rate / compression / aux-loss snapshot from the most-recent
+        ``forward``. Returns ``None`` if forward hasn't run yet. All values are
+        Python scalars so callers (e.g. the trainer's batched logger) can
+        accumulate them across steps without touching CUDA tensors.
+
+        Keys:
+          - ``aux_loss``: ``loss_weight * binomial_NLL`` (or ``None`` outside
+            training / in forced-boundary modes — same as ``aux_loss()``).
+          - ``n_boundaries``: total predicted boundaries across the batch.
+          - ``n_post_frontend``: total valid frames after the Conv2d frontend
+            across the batch (denominator for ``realized_prior``).
+          - ``n_input``: total valid mel-frame inputs across the batch
+            (denominator for end-to-end compression).
+        """
+        if self._cached_lengths is None:
+            return None
+        aux = self._cached_aux_loss
+        return {
+            "aux_loss": float(aux.detach().float().item()) if aux is not None else None,
+            "n_boundaries": int(self._cached_lengths.sum().item()),
+            "n_post_frontend": (
+                int(self._cached_post_frontend_lens.sum().item())
+                if self._cached_post_frontend_lens is not None
+                else 0
+            ),
+            "n_input": (
+                int(self._cached_input_lengths.sum().item())
+                if self._cached_input_lengths is not None
+                else 0
+            ),
+        }
 
     def output_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
         """Dynamic — returns the per-sample boundary counts cached by the
@@ -286,8 +321,15 @@ class BoundaryPredictorDownsampler(Downsampler):
         # 4. Mean-pool by segment id.
         pooled = self._mean_pool(boundaries, h)
 
-        # 5. Cache per-sample output lengths and (training-only) aux loss.
+        # 5. Cache per-sample output lengths, post-frontend lengths, and
+        # (training-only) aux loss. The post-frontend / input-length caches
+        # are read by ``last_stats()`` for boundary-rate logging.
         self._cached_lengths = boundaries.sum(dim=1).long().clamp(min=1)
+        self._cached_post_frontend_lens = actual_lens.detach().long()
+        if input_lengths is not None:
+            self._cached_input_lengths = input_lengths.detach().long()
+        else:
+            self._cached_input_lengths = None
         if self.training and self.boundary_mode == "learned":
             self._cached_aux_loss = self.loss_weight * self._binomial_loss(boundaries, actual_lens)
         else:

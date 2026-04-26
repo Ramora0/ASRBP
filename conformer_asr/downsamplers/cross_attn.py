@@ -167,27 +167,28 @@ class _CrossAttnBlock(nn.Module):
 
 
 class CrossAttnDownsampler(Downsampler):
-    """Conv2d frontend → dilated RF expansion → strided pick → cross-attn.
+    """Full Conv2d stack (mel preserved) → projection → strided pick → cross-attn.
 
     Args:
-        n_mels: Mel-bin count (passed straight through to the frontend).
-        hidden: Transformer hidden size (frontend output dim and cross-attn
-            dim).
-        dropout: Dropout after the frontend's projection AND on the
-            attention sublayer's residual branch.
-        strides: Per-layer ``[time, mel]`` strides for the frontend Conv2d
-            stack (same convention as ``Conv2dDownsampler``). Default
-            ``[[2,2],[2,2]]`` matches c4x — 4× time reduction.
-        dilations: Per-layer dilation factors for the post-frontend
-            ``Conv1d`` stack. Each layer is kernel-3, stride-1, padding =
-            dilation, so length is preserved (rate doesn't change). Default
-            ``(2, 2)`` lifts each frame's RF from 7 mel frames (c4x) to 39
-            (slightly above c16x's 31), giving the picked queries a
-            depth-rich representation at init. ``()`` disables the block.
-        stride: Subsample factor applied after the dilation block. ``out[:,
-            ::stride, :]`` from the post-dilation sequence seeds the queries
-            for cross-attention. With the default ``stride=4`` on top of the
-            4× conv stem, total compression is 16×.
+        n_mels: Mel-bin count.
+        hidden: Channel count for every Conv2d layer AND the post-conv hidden
+            size after projection (also the cross-attention dim).
+        dropout: Dropout after the post-conv projection AND on the attention
+            sublayer's residual branch.
+        strides: Per-layer ``[time, mel]`` strides for the strided portion of
+            the conv stack (same convention as ``Conv2dDownsampler``).
+            Default ``[[2,2],[2,2]]`` matches c4x — 4× time reduction.
+        dilations: Per-layer time-axis dilation factors for the post-strided
+            Conv2d layers. Each is kernel-(3,3), stride-(1,1), padding=
+            (dilation, 1), dilation=(dilation, 1) — preserves BOTH time
+            (length) AND mel (dim) while expanding time RF. Default
+            ``(2, 2)`` lifts each frame's time RF from 7 mel frames (c4x) to
+            39 (slightly above c16x's 31). Mel stays separate through every
+            conv layer, so cross-mel interactions are learned at depth like
+            c16x. ``()`` disables this block.
+        stride: Subsample factor applied after the conv stack to seed the
+            cross-attention queries. With the default ``stride=4`` on top of
+            the 4× strided stem, total compression is 16×.
         num_heads: Cross-attention heads.
         num_layers: Number of cross-attention blocks. Each block re-attends
             the (residually-updated) queries to the same key/value sequence.
@@ -212,33 +213,66 @@ class CrossAttnDownsampler(Downsampler):
             raise ValueError(f"stride must be >= 1, got {stride}")
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {num_layers}")
-        self.frontend = Conv2dDownsampler(
-            n_mels=n_mels, hidden=hidden, strides=strides, dropout=dropout
-        )
+        self.n_mels = int(n_mels)
         self.hidden = int(hidden)
         self.stride = int(stride)
+        self.strides = _normalize_strides(strides)
+        self.dilations = tuple(int(d) for d in dilations)
+        for i, d in enumerate(self.dilations):
+            if d < 1:
+                raise ValueError(f"dilations[{i}] must be >= 1, got {d}")
 
-        # Same-padded dilated 1D convs: preserve length, expand RF. Output
-        # length stays equal to the frontend's, so output_lengths arithmetic
-        # is unaffected by this block.
-        dilation_layers: list[nn.Module] = []
-        for d in dilations:
-            d_int = int(d)
-            if d_int < 1:
-                raise ValueError(f"dilations entries must be >= 1, got {d_int}")
-            dilation_layers.append(
-                nn.Conv1d(
-                    int(hidden),
+        # Build one Conv2d stack: strided frontend, then dilated layers. Mel
+        # axis is preserved through every layer (kernel-3 + stride-1 +
+        # padding-1 on the mel side for the dilated portion; padding rule is
+        # stride-conditional for the strided frontend). Final flatten +
+        # projection happens AFTER the whole stack — same shape as c16x's
+        # 4-Conv2d stem.
+        layers: list[nn.Module] = []
+        in_channels = 1
+        for t, m in self.strides:
+            t_pad = _padding_for_stride(t)
+            m_pad = _padding_for_stride(m)
+            layers.append(
+                nn.Conv2d(
+                    in_channels,
                     int(hidden),
                     kernel_size=3,
-                    padding=d_int,
-                    dilation=d_int,
+                    stride=(t, m),
+                    padding=(t_pad, m_pad),
                 )
             )
-            dilation_layers.append(nn.ReLU())
-        self.dilation_block: nn.Module = (
-            nn.Sequential(*dilation_layers) if dilation_layers else nn.Identity()
-        )
+            layers.append(nn.ReLU())
+            in_channels = int(hidden)
+        for d in self.dilations:
+            layers.append(
+                nn.Conv2d(
+                    in_channels,
+                    int(hidden),
+                    kernel_size=3,
+                    stride=1,
+                    padding=(d, 1),
+                    dilation=(d, 1),
+                )
+            )
+            layers.append(nn.ReLU())
+            in_channels = int(hidden)
+        self.convs = nn.Sequential(*layers)
+
+        # Mel after the strided portion (dilated layers preserve mel).
+        mel_after = self.n_mels
+        for _, m in self.strides:
+            mel_after = _length_after(mel_after, m)
+        if mel_after <= 0:
+            raise ValueError(
+                f"n_mels={self.n_mels} too small for mel strides {[m for _, m in self.strides]}"
+            )
+        self.mel_after = int(mel_after)
+
+        # Single projection AFTER the whole conv stack (this is the *only*
+        # point where mel collapses, mirroring c16x).
+        self.proj = nn.Linear(int(hidden) * self.mel_after, int(hidden))
+        self.proj_dropout = nn.Dropout(float(dropout))
 
         self.layers = nn.ModuleList([
             _CrossAttnBlock(
@@ -250,14 +284,25 @@ class CrossAttnDownsampler(Downsampler):
             for _ in range(int(num_layers))
         ])
 
+    def _post_conv_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
+        """Per-sample valid time length after the conv stack.
+
+        Only the strided layers change time length; dilated layers
+        (stride=1, same-padding) preserve it.
+        """
+        lengths = input_lengths
+        for t, _ in self.strides:
+            lengths = _length_after(lengths, t)
+        return lengths
+
     def output_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
-        """Frontend output lengths, then ceil-divide by ``stride``.
+        """Conv-stack output lengths, then ceil-divide by ``stride``.
 
         Picking ``out[:, ::stride, :]`` from a length-``L`` sequence yields
         ``ceil(L / stride)`` elements; the same arithmetic gives the per-sample
         valid count.
         """
-        post = self.frontend.output_lengths(input_lengths)
+        post = self._post_conv_lengths(input_lengths)
         if self.stride == 1:
             return post
         return torch.div(post + self.stride - 1, self.stride, rounding_mode="floor")
@@ -267,29 +312,31 @@ class CrossAttnDownsampler(Downsampler):
         x: torch.Tensor,
         input_lengths: torch.LongTensor | None = None,
     ) -> torch.Tensor:
-        # 1. Conv2d frontend: (B, T_mel, n_mels) -> (B, T_cnn, hidden).
-        h = self.frontend(x)
+        # 1. Full Conv2d stack: (B, T_mel, n_mels) -> (B, hidden, T_cnn, mel_after).
+        x = x.unsqueeze(1)  # (B, 1, T_mel, n_mels)
+        x = self.convs(x)
+        bsz, hidden_dim, T_cnn, m_out = x.shape
 
-        # 2. Dilation block: same-padded dilated Conv1d → preserves length,
-        # expands per-frame RF. Conv1d expects (B, C, T), so transpose around it.
-        h = self.dilation_block(h.transpose(1, 2)).transpose(1, 2)
-
-        B, T_cnn, _ = h.shape
+        # 2. Flatten mel + project AFTER the whole stack (mel only collapses
+        # here, mirroring c16x). (B, hidden, T_cnn, m_out) -> (B, T_cnn, hidden).
+        h = x.permute(0, 2, 1, 3).reshape(bsz, T_cnn, hidden_dim * m_out)
+        h = self.proj(h)
+        h = self.proj_dropout(h)
         device = h.device
 
-        # 3. Build a key-padding mask covering padded post-frontend positions.
+        # 3. Build a key-padding mask covering padded post-conv positions.
         # SDPA bool-mask convention: True = participates in attention.
         attn_mask: torch.Tensor | None = None
         if input_lengths is not None:
-            post_lens = self.frontend.output_lengths(input_lengths.to(device)).long()
+            post_lens = self._post_conv_lengths(input_lengths.to(device)).long()
             post_lens = post_lens.clamp(min=1, max=T_cnn)
             pos = torch.arange(T_cnn, device=device).unsqueeze(0)
             valid = pos < post_lens.unsqueeze(1)  # (B, T_cnn)
-            attn_mask = valid[:, None, None, :]  # (B, 1, 1, T_k); broadcasts over heads + queries
+            attn_mask = valid[:, None, None, :]  # (B, 1, 1, T_k)
 
-        # 4. Pick every ``stride``-th frame as queries. Track which post-frontend
-        # indices we picked — those are the RoPE positions for the queries, so
-        # the relative offset Q[i] - K[j] under RoPE matches the true gap
+        # 4. Pick every ``stride``-th frame as queries. Track which post-conv
+        # indices we picked — those are the RoPE positions for the queries,
+        # so the relative offset Q[i] - K[j] under RoPE matches the true gap
         # between picked frame ``i*stride`` and key frame ``j``.
         if self.stride > 1:
             q = h[:, ::self.stride, :]
@@ -299,9 +346,9 @@ class CrossAttnDownsampler(Downsampler):
             q_positions = torch.arange(T_cnn, device=device)
         k_positions = torch.arange(T_cnn, device=device)
 
-        # 5. Cross-attend (one or more blocks). With zero-init out_proj, this
-        # is the identity at step 0 — the model behaves as "frontend +
-        # dilations + strided pick + conformer" until cross-attn weights move.
+        # 5. Cross-attend. With zero-init out_proj, this is the identity at
+        # step 0 — the model behaves as "convs + strided pick + conformer"
+        # until cross-attn weights move.
         for layer in self.layers:
             q = layer(q, h, q_positions, k_positions, attn_mask)
 

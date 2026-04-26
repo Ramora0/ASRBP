@@ -497,6 +497,12 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._aed_loss_sum = 0.0
         self._ctc_loss_sum = 0.0
         self._loss_component_count = 0
+        # CTC viability: # samples where ``input_len >= label_len + n_dup``,
+        # over the same logging window as ``aed/ctc_loss``. At low downsample
+        # rates this stays at 1.0; at high rates it drops as long-target /
+        # short-input clips fall under the CTC alignment floor.
+        self._ctc_viable_count = 0
+        self._ctc_viable_total = 0
         self._bp_aux_loss_sum = 0.0
         self._bp_n_boundaries = 0
         self._bp_n_post_frontend = 0
@@ -546,6 +552,15 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         if ctc_loss is not None:
             self._ctc_loss_sum += float(ctc_loss.detach().float().item())
         self._loss_component_count += 1
+
+        # CTC viability rollup. ``ctc_viable`` is a (B,) bool tensor stamped
+        # by ``ConformerAEDWithCTC._compute_ctc_loss``; sum / total gives the
+        # fraction of samples in this window where CTC's input-length floor
+        # is met. Skipped silently for AED-only models (no CTC head).
+        ctc_viable = getattr(outputs, "ctc_viable", None)
+        if ctc_viable is not None:
+            self._ctc_viable_count += int(ctc_viable.sum().item())
+            self._ctc_viable_total += int(ctc_viable.numel())
 
         # Boundary-predictor stats. Any downsampler that exposes
         # ``last_stats()`` gets its aux loss + realized rate / compression
@@ -608,9 +623,15 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
             denom = float(self._loss_component_count)
             logs["train/aed_loss"] = self._aed_loss_sum / denom
             logs["train/ctc_loss"] = self._ctc_loss_sum / denom
+            if self._ctc_viable_total > 0:
+                logs["train/ctc_viable_pct"] = (
+                    self._ctc_viable_count / float(self._ctc_viable_total)
+                )
             self._aed_loss_sum = 0.0
             self._ctc_loss_sum = 0.0
             self._loss_component_count = 0
+            self._ctc_viable_count = 0
+            self._ctc_viable_total = 0
             if self._bp_step_count > 0:
                 logs["train/bp_aux_loss"] = self._bp_aux_loss_sum / float(self._bp_step_count)
                 if self._bp_n_post_frontend > 0:

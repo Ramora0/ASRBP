@@ -105,6 +105,12 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         x = self.downsampler(x, input_lengths=input_lengths)
         t_out = x.shape[1]
 
+        # Stash the post-downsampler tensor so an outer wrapper (e.g.
+        # ``ConformerAEDWithCTC`` with ``ctc_input="features"``) can attach a
+        # head to the conv-stem output without re-running it. Plain attribute
+        # (not a buffer/parameter) so it stays out of state_dict.
+        self._features_for_ctc = x
+
         # Downsample the pre-stem attention mask so the Conformer blocks see
         # the correct (B, T') mask for self-attention.
         encoder_attention_mask = None

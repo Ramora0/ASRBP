@@ -88,6 +88,14 @@ class ModelConfig:
     # Spectrogram → transformer-input bridge. Nested so the downsampler family
     # can carry its own knobs without bloating the top-level ``ModelConfig``.
     downsampler: DownsamplerConfig = field(default_factory=DownsamplerConfig)
+    # Where the CTC head taps the encoder stack. ``"encoder"`` (default) reads
+    # the post-Conformer-blocks hidden states — the standard hybrid-CTC
+    # configuration, with CTC gradient flowing through the full encoder.
+    # ``"features"`` reads the post-downsampler tensor instead — CTC trains
+    # only the conv stem and never reaches the Conformer blocks. Same shape
+    # / time dim either way (Conformer doesn't change T), so the CTC head
+    # itself is identical and checkpoints round-trip between modes.
+    ctc_input: str = "encoder"
 
 
 @dataclass

@@ -385,7 +385,15 @@ def main() -> None:
                 enc_mask = model.encoder._get_feature_vector_attention_mask(
                     enc_hidden.size(1), attention_mask
                 )
-                ctc_logits = model.ctc_head(enc_hidden)  # (B, T', V)
+                # CTC head reads either the encoder hidden states (default) or
+                # the post-downsampler tensor (``ctc_input='features'``). Both
+                # share the same time dim, so the rest of the rescore path is
+                # identical.
+                if getattr(model, "ctc_input", "encoder") == "features":
+                    ctc_source = model.encoder._features_for_ctc
+                else:
+                    ctc_source = enc_hidden
+                ctc_logits = model.ctc_head(ctc_source)  # (B, T', V)
 
                 B, T_enc, V = ctc_logits.shape
                 # (B, T', V) -> (B*k, T', V) by expanding each sample across its k beams.

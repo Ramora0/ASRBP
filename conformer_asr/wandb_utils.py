@@ -325,6 +325,8 @@ class CTCEvalCallback(TrainerCallback):
         # (otherwise short-audio batches would be under-weighted vs long ones).
         ctc_loss_sum = 0.0
         ctc_loss_frames = 0
+        ctc_viable_count = 0
+        ctc_viable_total = 0
 
         use_autocast = (
             device.type == "cuda"
@@ -372,6 +374,10 @@ class CTCEvalCallback(TrainerCallback):
                         ctc_loss_sum += float(outputs.ctc_loss.detach().float().item()) * batch_frames
                         ctc_loss_frames += batch_frames
 
+                    if outputs.ctc_viable is not None:
+                        ctc_viable_count += int(outputs.ctc_viable.sum().item())
+                        ctc_viable_total += int(outputs.ctc_viable.numel())
+
                     pred_ids = ctc_greedy_decode(
                         ctc_logits.float(),
                         input_lengths=input_lengths,
@@ -390,11 +396,16 @@ class CTCEvalCallback(TrainerCallback):
 
         wer = compute_wer(preds_all, refs_all)
         ctc_loss_mean = (ctc_loss_sum / ctc_loss_frames) if ctc_loss_frames > 0 else None
+        ctc_viable_pct = (
+            ctc_viable_count / float(ctc_viable_total) if ctc_viable_total > 0 else None
+        )
 
         if metrics is not None:
             metrics["eval/ctc_wer"] = float(wer)
             if ctc_loss_mean is not None:
                 metrics["eval/ctc_loss"] = float(ctc_loss_mean)
+            if ctc_viable_pct is not None:
+                metrics["eval/ctc_viable_pct"] = float(ctc_viable_pct)
 
         wandb = self._ensure_wandb()
         if wandb is not None:
@@ -405,11 +416,16 @@ class CTCEvalCallback(TrainerCallback):
             }
             if ctc_loss_mean is not None:
                 payload["eval/ctc_loss"] = float(ctc_loss_mean)
+            if ctc_viable_pct is not None:
+                payload["eval/ctc_viable_pct"] = float(ctc_viable_pct)
             wandb.log(payload, step=state.global_step)
         loss_str = f" ctc_loss={ctc_loss_mean:.4f}" if ctc_loss_mean is not None else ""
+        viable_str = (
+            f" ctc_viable_pct={ctc_viable_pct:.4f}" if ctc_viable_pct is not None else ""
+        )
         print(
             f"[ctc-eval] step={state.global_step} epoch={state.epoch} "
-            f"ctc_wer={wer:.4f}{loss_str}"
+            f"ctc_wer={wer:.4f}{loss_str}{viable_str}"
         )
 
 

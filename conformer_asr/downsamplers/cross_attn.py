@@ -1,38 +1,44 @@
 """Cross-attention downsampler.
 
-Conv2d frontend → dilated-conv RF expansion → pick every Nth post-frontend
-vector → cross-attend that subset to the full post-frontend sequence to
-inject temporal context, then hand the refined queries to the encoder.
+Full Conv2d stack (strided frontend + dilated layers, mel axis preserved
+throughout) → flatten + project → pick every Nth → cross-attend the picked
+subset to the full post-conv sequence, then hand the refined queries to the
+encoder.
 
 Pipeline inside ``forward``:
-  1. ``Conv2dDownsampler`` frontend bridges ``(B, T_mel, n_mels)`` to
-     ``(B, T_cnn, hidden)`` (default: 4× time reduction, matching c4x).
-  2. ``dilation_block``: same-padded dilated Conv1d layers that **preserve
-     rate** while expanding per-frame receptive field. Default
-     ``dilations=(2, 2)`` on top of the c4x frontend lifts each frame's RF
-     from 7 mel frames (c4x) to 39 mel frames — slightly above c16x's RF of
-     31. Combined with the zero-init on the cross-attn output projection
-     below, this makes the downsampler a strict superset of a 16×-RF conv
-     stack at init.
-  3. Pick ``out[:, ::stride, :]`` from the dilation-block output to seed
-     queries — these are the eventual encoder inputs after refinement.
-     With the default ``stride=4`` on top of the 4× conv stem, total
-     downsampling is 16× (≈6.25 Hz on 100 Hz mels).
+  1. ``convs``: a single ``nn.Sequential`` of Conv2d layers — same shape as
+     ``Conv2dDownsampler`` plus extra dilated layers. The strided portion
+     (default ``[[2,2],[2,2]]``) downsamples both time and mel, matching the
+     c4x stem. The dilated portion (default ``dilations=(2, 2)``) keeps
+     stride=1 on both axes — kernel-3 Conv2d with padding=(dilation, 1) and
+     dilation=(dilation, 1) preserves both length AND mel dim while
+     expanding the time-axis receptive field. Mel stays separate through
+     every conv layer (4 layers total at default), so deep cross-mel
+     interactions are learned just like c16x.
+  2. Flatten the mel axis and apply a single ``Linear(hidden * mel_after,
+     hidden)`` — placed after ALL convs, same as c16x's stem. Yields
+     ``(B, T_cnn, hidden)`` at the post-frontend rate (4× downsampled
+     by default, ≈25 Hz).
+  3. Pick ``out[:, ::stride, :]`` to seed queries. With the default
+     ``stride=4`` on top of the 4× conv stem, total downsampling is 16×
+     (≈6.25 Hz on 100 Hz mels).
   4. ``num_layers`` pre-norm cross-attention blocks: queries = the picked
-     subset (residually updated), keys/values = the full post-dilation
+     subset (residually updated), keys/values = the full post-conv
      sequence. RoPE is applied to Q/K with positions taken from the
      **original post-frontend indices** — queries get ``[0, stride, 2*stride,
      ...]``, keys get ``[0, 1, ..., T_cnn-1]`` — so the relative offset
      under RoPE matches the true frame-rate gap. Padded positions are
      masked out of attention. The output projection is zero-init'd, so at
      step 0 the cross-attn contributes nothing — the model behaves as
-     "frontend → dilations → strided pick → conformer", a strict superset
-     of a 16× conv stack.
+     "full Conv2d stack → strided pick → conformer", which is structurally
+     a 4-Conv2d stem plus a strided slice (the only difference vs c16x:
+     the slice replaces c16x's last stride-2 conv).
   5. Return the refined queries.
 
-Output length is a pure function of input length (frontend arithmetic +
-ceil-divide by ``stride``; dilations preserve length) — this is a static
-downsampler. ``aux_loss`` stays at the base-class default ``None``.
+Output length is a pure function of input length (only the strided convs
+change rate; dilated layers preserve it; final ceil-divide by ``stride``).
+This is a static downsampler. ``aux_loss`` stays at the base-class default
+``None``.
 """
 from __future__ import annotations
 
@@ -43,7 +49,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import Downsampler
-from .conv2d import Conv2dDownsampler
+from .conv2d import _length_after, _normalize_strides, _padding_for_stride
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:

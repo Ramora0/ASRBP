@@ -10,9 +10,14 @@ Pipeline inside ``forward``:
      ``Conv2dDownsampler`` plus extra dilated layers. The strided portion
      (default ``[[2,2],[2,2]]``) downsamples both time and mel, matching the
      c4x stem. The dilated portion (default ``dilations=(2, 2)``) keeps
-     stride=1 on both axes — kernel-3 Conv2d with padding=(dilation, 1) and
-     dilation=(dilation, 1) preserves both length AND mel dim while
-     expanding the time-axis receptive field. Mel stays separate through
+     stride=1 on both axes — kernel-3 Conv2d with padding=(0, 1) and
+     dilation=(dilation, 1). Mel padding 1 preserves the mel dim; time
+     padding 0 (valid conv) shrinks time by ``2*dilation`` per dilated
+     layer. The valid-padding choice is what makes the dilated stack +
+     final strided pick the exact à trous re-parameterization of a
+     stride-2 cascade: with pad=0 the kept output positions read the same
+     input windows as the equivalent strided-cascade outputs (see
+     ``scripts/verify_xa_c16x_equivalence.py``). Mel stays separate through
      every conv layer (4 layers total at default), so deep cross-mel
      interactions are learned just like c16x.
   2. Flatten the mel axis and apply a single ``Linear(hidden * mel_after,
@@ -35,8 +40,9 @@ Pipeline inside ``forward``:
      the slice replaces c16x's last stride-2 conv).
   5. Return the refined queries.
 
-Output length is a pure function of input length (only the strided convs
-change rate; dilated layers preserve it; final ceil-divide by ``stride``).
+Output length is a pure function of input length (strided convs apply
+the standard ``(l-3)//s+1`` shrink; valid-pad dilated convs subtract
+``2*dilation``; final ceil-divide by ``stride``).
 This is a static downsampler. ``aux_loss`` stays at the base-class default
 ``None``.
 """
@@ -180,12 +186,15 @@ class CrossAttnDownsampler(Downsampler):
             Default ``[[2,2],[2,2]]`` matches c4x — 4× time reduction.
         dilations: Per-layer time-axis dilation factors for the post-strided
             Conv2d layers. Each is kernel-(3,3), stride-(1,1), padding=
-            (dilation, 1), dilation=(dilation, 1) — preserves BOTH time
-            (length) AND mel (dim) while expanding time RF. Default
-            ``(2, 2)`` lifts each frame's time RF from 7 mel frames (c4x) to
-            39 (slightly above c16x's 31). Mel stays separate through every
-            conv layer, so cross-mel interactions are learned at depth like
-            c16x. ``()`` disables this block.
+            (0, 1), dilation=(dilation, 1) — valid on the time axis (shrinks
+            time by ``2*dilation`` per layer), same on the mel axis
+            (preserves mel dim). Valid time padding is what makes the
+            full stack + strided pick a bit-exact à trous re-write of a
+            stride-2 cascade. Default ``(2, 2)`` lifts each frame's time RF
+            from 7 mel frames (c4x) to 39 (slightly above c16x's 31). Mel
+            stays separate through every conv layer, so cross-mel
+            interactions are learned at depth like c16x. ``()`` disables
+            this block.
         stride: Subsample factor applied after the conv stack to seed the
             cross-attention queries. With the default ``stride=4`` on top of
             the 4× strided stem, total compression is 16×.
@@ -255,7 +264,7 @@ class CrossAttnDownsampler(Downsampler):
                     int(hidden),
                     kernel_size=3,
                     stride=1,
-                    padding=(d, 1),
+                    padding=(0, 1),
                     dilation=(d, 1),
                 )
             )
@@ -291,12 +300,19 @@ class CrossAttnDownsampler(Downsampler):
     def _post_conv_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
         """Per-sample valid time length after the conv stack.
 
-        Only the strided layers change time length; dilated layers
-        (stride=1, same-padding) preserve it.
+        Strided layers shrink by ``(l-3)//s+1`` (kernel 3, pad 0). Dilated
+        layers are stride 1 with pad=(0,1) — valid on the time axis — so
+        each shrinks time by ``2*dilation``.
         """
         lengths = input_lengths
         for t, _ in self.strides:
             lengths = _length_after(lengths, t)
+        for d in self.dilations:
+            shrink = 2 * int(d)
+            if isinstance(lengths, torch.Tensor):
+                lengths = torch.clamp(lengths - shrink, min=0)
+            else:
+                lengths = max(lengths - shrink, 0)
         return lengths
 
     def output_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:

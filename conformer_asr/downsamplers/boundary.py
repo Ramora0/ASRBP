@@ -5,18 +5,27 @@ from ``SpeechbrainBP/boundary_predictor.py`` and folded into this codebase's
 ``Downsampler`` interface.
 
 Pipeline inside ``forward``:
-  1. ``Conv2dDownsampler`` frontend bridges ``(B, T_mel, n_mels)`` to
-     ``(B, T_cnn, hidden)`` and reduces the frame rate (default 4× — same
-     stem the rest of the project uses).
-  2. A 2-layer MLP scores each frame, sigmoid → per-frame boundary
-     probability.
+  1. Run the Conv2d stack only (no flatten-projection yet) to produce the
+     pre-projection features ``(B, T_cnn, hidden * mel_after)``. The
+     frontend's ``proj`` linear is deferred until step 6 — ``proj`` is
+     linear so order-of-ops with the mean-pool is mathematically
+     irrelevant, and deferring lets BP score boundaries on the ``mel_after``×
+     richer pre-projection feature space rather than the rank-≤``hidden``
+     view the proj would otherwise collapse it into.
+  2. A 2-layer MLP with a small bottleneck (``bp_hidden``, default
+     ``hidden // 4``) scores each frame on those rich features, sigmoid →
+     per-frame boundary probability. The bottleneck keeps the BP MLP
+     param count bounded — the input dim is ~``mel_after``× larger than
+     in the original (post-projection) design.
   3. During training: ``RelaxedBernoulli`` rsample for differentiable soft
      boundaries, threshold at 0.5 for the hard pass, straight-through
      estimator wires gradients through the soft path. During eval: hard
      threshold on the sigmoid probability directly (no sampling noise).
   4. Force the last valid frame of each sample to be a boundary, mask
      padded frames to zero — guarantees at least one segment per sample.
-  5. Mean-pool hidden states by segment id (cumsum-derived).
+  5. Mean-pool the pre-projection features by segment id (cumsum-derived).
+  6. Apply the frontend's deferred ``proj`` + ``dropout`` to the pooled
+     segments to land in ``(B, S, hidden)`` for the encoder.
 
 Two pieces of state are written to the module on every ``forward`` and
 consumed by the rest of the model:
@@ -87,6 +96,12 @@ class BoundaryPredictorDownsampler(Downsampler):
             a boundary — pass-through, debug), or ``"alternating"`` (every
             other frame — fixed 2× compression for sanity checks). Only
             ``"learned"`` carries the binomial loss.
+        bp_hidden: Bottleneck width of the boundary MLP. The MLP is
+            ``Linear(hidden * mel_after → bp_hidden) → GELU →
+            Linear(bp_hidden → 1)``; keeping ``bp_hidden`` modest is what
+            stops the first layer from blowing up, since its input dim is
+            ``mel_after``× larger than ``hidden``. Default
+            ``max(hidden // 4, 16)``.
     """
 
     def __init__(
@@ -101,6 +116,7 @@ class BoundaryPredictorDownsampler(Downsampler):
         mlp_dropout: float = 0.1,
         loss_weight: float = 10.0,
         boundary_mode: str = "learned",
+        bp_hidden: int | None = None,
     ):
         super().__init__()
         if boundary_mode not in {"learned", "all", "alternating"}:
@@ -117,10 +133,18 @@ class BoundaryPredictorDownsampler(Downsampler):
         self.loss_weight = float(loss_weight)
         self.boundary_mode = boundary_mode
 
+        # BP scores boundaries on the conv stack's pre-projection features
+        # (``hidden * mel_after`` per frame). Bottleneck the MLP at
+        # ``bp_hidden`` so the first layer's params stay bounded — input
+        # dim is ~``mel_after``× larger than the original post-projection
+        # design, so a full-width MLP would explode.
+        flat_dim = self.frontend.proj.in_features
+        bp_hidden = int(bp_hidden) if bp_hidden is not None else max(self.hidden // 4, 16)
+        self.bp_hidden = bp_hidden
         self.boundary_mlp = nn.Sequential(
-            nn.Linear(hidden, hidden),
+            nn.Linear(flat_dim, bp_hidden),
             nn.GELU(),
-            nn.Linear(hidden, 1),
+            nn.Linear(bp_hidden, 1),
         )
         self._init_prior_bias()
         self.mlp_dropout = nn.Dropout(p=mlp_dropout)
@@ -315,12 +339,18 @@ class BoundaryPredictorDownsampler(Downsampler):
         x: torch.Tensor,
         input_lengths: torch.LongTensor | None = None,
     ) -> torch.Tensor:
-        # 1. Conv2d frontend: (B, T_mel, n_mels) -> (B, T_cnn, hidden).
-        h = self.frontend(x)
-        B, T_cnn, _ = h.shape
-        device = h.device
+        # 1. Conv2d stack only — pre-projection features. Bypassing
+        # ``frontend.forward`` lets BP score boundaries on the rich
+        # ``hidden * mel_after`` features; the proj + dropout are
+        # deferred to step 6 (proj is linear, so doing it after the
+        # mean-pool gives an identical encoder input but a richer signal
+        # for the BP scorer).
+        conv_out = self.frontend.convs(x.unsqueeze(1))
+        B, n_chan, T_cnn, m_out = conv_out.shape
+        h_flat = conv_out.permute(0, 2, 1, 3).reshape(B, T_cnn, n_chan * m_out)
+        device = h_flat.device
 
-        # 2. Per-sample valid lengths after the frontend (in T_cnn frames).
+        # 2. Per-sample valid lengths after the conv stack.
         if input_lengths is None:
             actual_lens = torch.full((B,), T_cnn, dtype=torch.long, device=device)
         else:
@@ -330,16 +360,18 @@ class BoundaryPredictorDownsampler(Downsampler):
         pos = torch.arange(T_cnn, device=device).unsqueeze(0)
         valid_mask = (pos < actual_lens.unsqueeze(1)).float()
 
-        # 3. Predict / force boundaries.
+        # 3. Predict / force boundaries on the pre-projection features.
         if self.boundary_mode == "all":
             boundaries = self._forced_boundaries(T_cnn, 1, valid_mask, actual_lens, B, device)
         elif self.boundary_mode == "alternating":
             boundaries = self._forced_boundaries(T_cnn, 2, valid_mask, actual_lens, B, device)
         else:
-            boundaries = self._learned_boundaries(h, valid_mask, actual_lens, T_cnn)
+            boundaries = self._learned_boundaries(h_flat, valid_mask, actual_lens, T_cnn)
 
-        # 4. Mean-pool by segment id.
-        pooled = self._mean_pool(boundaries, h)
+        # 4. Mean-pool the pre-projection features by segment id, then
+        # apply the deferred proj + dropout to land in (B, S, hidden).
+        pooled_flat = self._mean_pool(boundaries, h_flat)
+        pooled = self.frontend.dropout(self.frontend.proj(pooled_flat))
 
         # 5. Cache per-sample output lengths, post-frontend lengths, and
         # (training-only) aux loss. The post-frontend / input-length caches

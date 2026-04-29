@@ -3,9 +3,10 @@ model:
   # for the registered options.
   encoder_type: conformer
   decoder_type: bart
-  # Conformer-M sized to match configs/cnns/c4x.yaml so the cross-attn run is
-  # a like-for-like comparison vs. the static 4× stem (and a 2× coarser
-  # frame rate downstream — encoder ops drop accordingly).
+  # Conformer-M sized to match configs/xa/xa_16x.yaml so the bp_xa run is a
+  # like-for-like comparison vs. uniform strided-pick XA at the same
+  # compression rate. The ONLY difference between this config and xa_16x is
+  # the downsampler block below (BP-predicted picking instead of strided).
   encoder_hidden_size: 256
   encoder_num_hidden_layers: 16
   encoder_num_attention_heads: 4
@@ -18,38 +19,37 @@ model:
   n_mels: 80
   n_fft: 400
   hop_length: 160
-  # Cross-attention downsampler — feature extractor only. C4x-style Conv2d
-  # frontend (4× time stem) + dilated layers produces a 25 Hz post-CNN
-  # sequence; the strided pick (every 4th frame) is the encoder's input at
-  # ≈6.25 Hz. The cross-attn refinement itself is *interleaved* between
-  # conformer layers — see ``cross_attn_layer_indices`` below — so this
-  # downsampler now just owns the CNN stack and the K/V cache that every
-  # interleaved tap reads from.
+  # BP+XA downsampler. Same conv stack as xa_16x (4× strided + dilated, mel
+  # preserved through every layer, 31-frame post-CNN RF), so the K/V cache
+  # the encoder's interleaved XA blocks read is identical. The only
+  # architectural difference vs xa_16x: queries are gathered at predicted
+  # frame indices (BP-style scorer) instead of at uniform strides.
   #
-  # Dilation schedule [1, 2] is the à trous equivalent of c16x's remaining
-  # stride-2, stride-2 cascade after the strided frontend: at jump=4, a
-  # d=1 kernel reads 3 adjacent layer-2 frames (= what c16x layer 3 reads),
-  # and a d=2 kernel on top of that replicates layer 4. RF = 31 input
-  # frames after picking every 4th — exactly matches c16x's pure-stride
-  # stem with dense coverage. This is what gives the interleaved XA blocks
-  # something rich to attend to.
+  # prior=0.25 ⇒ ~16× total compression (4× conv stem × 4× selector). The
+  # encoder's interleaved XA blocks see Q at the actual predicted frame
+  # indices (post-CNN coords) for RoPE, so Q-K relative offsets reflect
+  # the true frame-rate gap between picked tokens and key positions.
   #
-  # See conformer_asr/downsamplers/cross_attn.py for the full pipeline.
+  # See conformer_asr/downsamplers/bp_xa.py for the full pipeline.
   downsampler:
-    type: cross_attn
+    type: bp_xa
     kwargs:
       strides: [[2, 2], [2, 2]]
       dilations: [1, 2]
-      stride: 4
-  # Interleaved cross-attention. After each (1-indexed) conformer layer
-  # listed here, a CrossAttnBlock re-attends the residual stream against the
-  # downsampler's cached 25 Hz post-CNN feature map. K/V is computed once
-  # per encoder forward by SharedKVProjector and reused across every tap,
-  # so dense tapping (one per conformer layer) is cheap — per-tap marginal
-  # cost is just q_proj + out_proj at the picked rate (~8% of one conformer
-  # layer's compute). Tapping every layer matches the architecture's
-  # observed behavior (XA carries 2–3× the residual signal of the adjacent
-  # conformer layer at every depth — see train/xa_relative_strength_l*).
+      prior: 0.25
+      temp: 0.1
+      mlp_dropout: 0.1
+      loss_weight: 10.0
+      boundary_mode: learned
+      bp_hidden: 64
+  # Interleaved cross-attention — identical schedule to xa_16x.yaml so the
+  # comparison isolates "BP-predicted picking" as the only architectural
+  # difference. Encoder's _encoder_with_xa reads downsampler._kept_indices
+  # for Q's per-sample RoPE positions; falls back to stride-based positions
+  # when the downsampler doesn't provide them (e.g. cross_attn). K/V is
+  # shared across taps via SharedKVProjector, so one tap per conformer
+  # layer is roughly the cost of 4 sparse taps under the old per-block
+  # K/V scheme.
   cross_attn_layer_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
   cross_attn_num_heads: 4
   cross_attn_dropout: 0.0
@@ -83,7 +83,7 @@ data:
   cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache
 
 train:
-  output_dir: outputs/run-xa-16x
+  output_dir: outputs/run-bp-xa-16x
   per_device_train_batch_size: 64
   per_device_eval_batch_size: 8
   effective_batch_size: 256
@@ -117,7 +117,7 @@ wandb:
   enabled: true
   project: conformer-asr-librispeech
   entity: null
-  run_name: conformer-xa-16x
+  run_name: conformer-bp-xa-16x
   group: null
   tags: []
   notes: ""

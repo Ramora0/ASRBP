@@ -17,6 +17,7 @@ from typing import Any, Callable
 from ..config import DownsamplerConfig
 from .base import Downsampler
 from .boundary import BoundaryPredictorDownsampler
+from .bp_xa import BPXADownsampler
 from .conv2d import Conv2dDownsampler
 from .cross_attn import CrossAttnDownsampler
 
@@ -25,6 +26,7 @@ DOWNSAMPLERS: dict[str, Callable[..., Downsampler]] = {
     "conv2d": Conv2dDownsampler,
     "boundary_predictor": BoundaryPredictorDownsampler,
     "cross_attn": CrossAttnDownsampler,
+    "bp_xa": BPXADownsampler,
 }
 
 
@@ -54,6 +56,7 @@ __all__ = [
     "Conv2dDownsampler",
     "BoundaryPredictorDownsampler",
     "CrossAttnDownsampler",
+    "BPXADownsampler",
     "DOWNSAMPLERS",
     "build_downsampler",
 ]

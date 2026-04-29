@@ -41,7 +41,7 @@ from transformers.models.wav2vec2_conformer.modeling_wav2vec2_conformer import (
 )
 
 from ..downsamplers.base import Downsampler
-from ..downsamplers.cross_attn import CrossAttnBlock
+from ..downsamplers.cross_attn import CrossAttnBlock, SharedKVProjector
 from .preproc import InputNormalization, SpecAugment
 from .sdpa_patch import install_sdpa_attention_patch
 
@@ -89,6 +89,14 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
                     f"exposes a post-CNN K/V cache; "
                     f"{type(self.downsampler).__name__} does not."
                 )
+            # K/V are computed once per encoder forward by the shared
+            # projector and broadcast to every interleaved tap. See
+            # ``SharedKVProjector`` for the rationale (~80% per-tap compute
+            # lives in K/V projections at T_k = 4 × T_q).
+            self.shared_kv_projector = SharedKVProjector(
+                hidden=config.hidden_size,
+                num_heads=cross_attn_num_heads,
+            )
             self.cross_attn_blocks = nn.ModuleList([
                 CrossAttnBlock(
                     hidden=config.hidden_size,
@@ -99,6 +107,7 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
                 for _ in idx
             ])
         else:
+            self.shared_kv_projector = None
             self.cross_attn_blocks = nn.ModuleList()
 
         self.post_init()
@@ -248,14 +257,29 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
             kv_mask = self._get_post_cnn_attention_mask(kv.shape[1], pre_stem_attention_mask)
             kv_mask = kv_mask[:, None, None, :]  # SDPA shape (B, 1, 1, T_k)
 
-        # Q/K position indices in post-CNN coordinates. The downsampler's
-        # ``stride`` attribute gives the picked-frame spacing.
-        stride = int(getattr(self.downsampler, "stride", 1))
+        # Q/K position indices in post-CNN coordinates.
+        #   - Static downsamplers (cross_attn): Q at ``[0, stride, 2*stride, ...]``.
+        #   - Variable selector (bp_xa): downsampler stashes the per-sample
+        #     picked indices on ``_kept_indices`` (shape ``(B, T_q)``); we
+        #     pass those straight through, so each query's RoPE phase
+        #     matches the actual post-CNN frame it was picked from.
         T_k = kv.shape[1]
         T_q = hidden_states.shape[1]
         device = hidden_states.device
-        q_positions = torch.arange(0, T_q * stride, stride, device=device)[:T_q]
+        kept_indices = getattr(self.downsampler, "_kept_indices", None)
+        if kept_indices is not None:
+            q_positions = kept_indices  # (B, T_q)
+        else:
+            stride = int(getattr(self.downsampler, "stride", 1))
+            q_positions = torch.arange(0, T_q * stride, stride, device=device)[:T_q]
         k_positions = torch.arange(T_k, device=device)
+
+        # Shared K/V: project + RoPE-rotate once for the whole encoder pass,
+        # then reuse across every interleaved tap below. The K/V source and
+        # k_positions are identical across taps, so this is a strict compute
+        # win with no modeling-capacity loss on the K/V side (per-tap views
+        # are still expressible via each block's own query function).
+        K_shared, V_shared = self.shared_kv_projector(kv, k_positions)
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -290,7 +314,6 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         # capturing 0 instead would skew the accumulator's mean toward 0.
         n_taps = len(self.cross_attn_layer_indices)
         ref_layer_delta_rms: list[float | None] = [None] * n_taps
-        ref_layer_q_rms: list[float | None] = [None] * n_taps
 
         for i, layer in enumerate(encoder.layers):
             if output_hidden_states:
@@ -323,14 +346,10 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
                     with torch.no_grad():
                         ref_delta = (hidden_states - h_before_layer).detach().float()
                         ref_layer_delta_rms[tap] = float(ref_delta.pow(2).mean().sqrt().item())
-                        ref_layer_q_rms[tap] = float(
-                            h_before_layer.detach().float().pow(2).mean().sqrt().item()
-                        )
                 block = self.cross_attn_blocks[tap]
-                hidden_states = block(hidden_states, kv, q_positions, k_positions, kv_mask)
+                hidden_states = block(hidden_states, K_shared, V_shared, q_positions, kv_mask)
 
         self._last_ref_layer_delta_rms = ref_layer_delta_rms
-        self._last_ref_layer_q_rms = ref_layer_q_rms
 
         hidden_states = encoder.layer_norm(hidden_states)
         if output_hidden_states:
@@ -371,5 +390,4 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
             "xa_delta_rms": deltas,
             "xa_q_rms": q_rms,
             "xa_ref_layer_delta_rms": list(getattr(self, "_last_ref_layer_delta_rms", [])),
-            "xa_ref_layer_q_rms": list(getattr(self, "_last_ref_layer_q_rms", [])),
         }

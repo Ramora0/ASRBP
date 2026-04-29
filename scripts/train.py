@@ -477,19 +477,24 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
     mirroring how HF's built-in ``tr_loss`` accumulator drives ``train/loss``.
 
     When the encoder uses a boundary-predictor downsampler (or any downsampler
-    that exposes ``last_stats()``), the trainer also accumulates the BP
-    auxiliary loss + realized boundary-rate / compression metrics across
-    the logging window and emits them as ``train/bp_aux_loss``,
-    ``train/bp_realized_prior``, ``train/bp_compression`` (post-frontend),
-    and ``train/bp_total_compression`` (mel → post-BP). Static downsamplers
-    have no ``last_stats()`` so these keys simply don't appear.
+    that exposes ``last_stats()``), the trainer also accumulates BP
+    diagnostics across the logging window and emits them under a ``bp/``
+    section (so they group into their own panel in wandb). Train-time keys:
+    ``bp/aux_loss``, ``bp/realized_prior``, ``bp/compression`` (post-
+    frontend), ``bp/total_compression`` (mel → post-BP), plus the per-frame
+    distribution diagnostics (``bp/bias``, ``bp/logit_mean``, ``bp/logit_std``,
+    ``bp/prob_mean``, ``bp/frac_sat_low``, ``bp/frac_sat_high``) and gradient
+    norms captured after backward (``bp/bias_grad``, ``bp/mlp_last_w_grad``,
+    ``bp/mlp_first_w_grad``, ``bp/pre_norm_grad``, ``bp/post_norm_grad``).
+    Static downsamplers have no ``last_stats()`` so these keys simply don't
+    appear.
 
     The same accumulators run during evaluation (driven by ``prediction_step``
-    rather than ``compute_loss``), so the empirical compression at eval time
-    is surfaced as ``eval/bp_realized_prior`` / ``eval/bp_compression`` /
-    ``eval/bp_total_compression``. Eval-mode forwards in
-    ``BoundaryPredictorDownsampler`` skip the binomial loss, so
-    ``eval/bp_aux_loss`` is intentionally not emitted.
+    rather than ``compute_loss``); empirical compression at eval time is
+    surfaced under the same section as ``bp/eval_realized_prior`` /
+    ``bp/eval_compression`` / ``bp/eval_total_compression``. Eval-mode
+    forwards in ``BoundaryPredictorDownsampler`` skip the binomial loss, so
+    no ``bp/eval_aux_loss`` companion key is emitted.
     """
 
     def __init__(self, *args, **kwargs):
@@ -508,6 +513,24 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._bp_n_post_frontend = 0
         self._bp_n_input = 0
         self._bp_step_count = 0
+        # Per-frame distribution diagnostics (learned-mode only). Surfaced
+        # as ``bp/bias``, ``bp/logit_mean``, etc. on log boundary.
+        self._bp_diag_step_count = 0
+        self._bp_bias_sum = 0.0
+        self._bp_logit_mean_sum = 0.0
+        self._bp_logit_std_sum = 0.0
+        self._bp_prob_mean_sum = 0.0
+        self._bp_frac_sat_low_sum = 0.0
+        self._bp_frac_sat_high_sum = 0.0
+        # Gradient-norm diagnostics: captured AFTER super().training_step has
+        # run backward, so all .grad fields are populated. Lets us see whether
+        # the binomial loss is actually reaching the BP parameters.
+        self._bp_grad_step_count = 0
+        self._bp_bias_grad_sum = 0.0
+        self._bp_mlp_first_grad_sum = 0.0
+        self._bp_mlp_last_w_grad_sum = 0.0
+        self._bp_pre_norm_grad_sum = 0.0
+        self._bp_post_norm_grad_sum = 0.0
         # Eval-time BP accumulators. Reset on every ``evaluate()`` call so the
         # numbers come out per-eval rather than rolling across the whole run.
         self._eval_bp_n_boundaries = 0
@@ -521,7 +544,6 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._xa_delta_rms_sum: list[float] = []
         self._xa_q_rms_sum: list[float] = []
         self._xa_ref_delta_rms_sum: list[float] = []
-        self._xa_ref_q_rms_sum: list[float] = []
         # Per-tap reference counter — independent of ``_xa_step_count`` because
         # the conformer layer right before a tap can be layer-dropped
         # (10% / layer / step), in which case its delta isn't recorded.
@@ -594,27 +616,77 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                 self._bp_n_post_frontend += stats["n_post_frontend"]
                 self._bp_n_input += stats["n_input"]
                 self._bp_step_count += 1
+                # Per-frame distribution diagnostics (learned-mode only).
+                if "bp_bias" in stats:
+                    self._bp_bias_sum += stats["bp_bias"]
+                    self._bp_logit_mean_sum += stats["bp_logit_mean"]
+                    self._bp_logit_std_sum += stats["bp_logit_std"]
+                    self._bp_prob_mean_sum += stats["bp_prob_mean"]
+                    self._bp_frac_sat_low_sum += stats["bp_frac_sat_low"]
+                    self._bp_frac_sat_high_sum += stats["bp_frac_sat_high"]
+                    self._bp_diag_step_count += 1
             if "xa_delta_rms" in stats:
                 deltas = stats["xa_delta_rms"]
                 q_rms = stats["xa_q_rms"]
                 ref_d = stats.get("xa_ref_layer_delta_rms") or [None] * len(deltas)
-                ref_q = stats.get("xa_ref_layer_q_rms") or [None] * len(deltas)
                 if not self._xa_delta_rms_sum:
                     self._xa_delta_rms_sum = [0.0] * len(deltas)
                     self._xa_q_rms_sum = [0.0] * len(deltas)
                     self._xa_ref_delta_rms_sum = [0.0] * len(deltas)
-                    self._xa_ref_q_rms_sum = [0.0] * len(deltas)
                     self._xa_ref_step_count = [0] * len(deltas)
-                for i, (d, q, rd, rq) in enumerate(zip(deltas, q_rms, ref_d, ref_q)):
+                for i, (d, q, rd) in enumerate(zip(deltas, q_rms, ref_d)):
                     self._xa_delta_rms_sum[i] += float(d)
                     self._xa_q_rms_sum[i] += float(q)
-                    if rd is not None and rq is not None:
+                    if rd is not None:
                         self._xa_ref_delta_rms_sum[i] += float(rd)
-                        self._xa_ref_q_rms_sum[i] += float(rq)
                         self._xa_ref_step_count[i] += 1
                 self._xa_step_count += 1
 
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # Run forward+backward via the parent. Gradients are populated on
+        # all params after this call, but optimizer.step()/zero_grad() are
+        # still in the future (the outer trainer loop owns those). That's
+        # the right window to peek at the BP's grad fields.
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        self._capture_bp_grad_norms(model)
+        return loss
+
+    def _capture_bp_grad_norms(self, model) -> None:
+        """Read .grad off select BP parameters and add their norms to the
+        rolling sum. No-op for non-BP downsamplers and for the steps where
+        gradient accumulation hasn't yet attached a grad.
+        """
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        downsampler = getattr(getattr(unwrapped, "encoder", None), "downsampler", None)
+        if downsampler is None or not hasattr(downsampler, "boundary_mlp"):
+            return
+        bias = downsampler.boundary_mlp[-1].bias
+        last_w = downsampler.boundary_mlp[-1].weight
+        first_w = downsampler.boundary_mlp[0].weight
+        pre_w = getattr(downsampler, "pre_mlp_norm", None)
+        post_w = getattr(downsampler, "post_pool_norm", None)
+        # Some grads can be None if the param was layer-dropped or sees no
+        # gradient flow this step; skip in that case rather than crashing.
+        captured_any = False
+        if bias.grad is not None:
+            self._bp_bias_grad_sum += float(bias.grad.detach().norm().item())
+            captured_any = True
+        if last_w.grad is not None:
+            self._bp_mlp_last_w_grad_sum += float(last_w.grad.detach().norm().item())
+            captured_any = True
+        if first_w.grad is not None:
+            self._bp_mlp_first_grad_sum += float(first_w.grad.detach().norm().item())
+            captured_any = True
+        if pre_w is not None and pre_w.weight.grad is not None:
+            self._bp_pre_norm_grad_sum += float(pre_w.weight.grad.detach().norm().item())
+        if post_w is not None and post_w.weight.grad is not None:
+            self._bp_post_norm_grad_sum += float(post_w.weight.grad.detach().norm().item())
+        if captured_any:
+            self._bp_grad_step_count += 1
 
     def _accumulate_eval_bp_stats(self, model) -> None:
         """Read ``last_stats()`` off the model's downsampler and add to the
@@ -669,16 +741,16 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
             self._ctc_viable_count = 0
             self._ctc_viable_total = 0
             if self._bp_step_count > 0:
-                logs["train/bp_aux_loss"] = self._bp_aux_loss_sum / float(self._bp_step_count)
+                logs["bp/aux_loss"] = self._bp_aux_loss_sum / float(self._bp_step_count)
                 if self._bp_n_post_frontend > 0:
-                    logs["train/bp_realized_prior"] = (
+                    logs["bp/realized_prior"] = (
                         self._bp_n_boundaries / float(self._bp_n_post_frontend)
                     )
-                    logs["train/bp_compression"] = (
+                    logs["bp/compression"] = (
                         self._bp_n_post_frontend / max(1, self._bp_n_boundaries)
                     )
                 if self._bp_n_input > 0:
-                    logs["train/bp_total_compression"] = (
+                    logs["bp/total_compression"] = (
                         self._bp_n_input / max(1, self._bp_n_boundaries)
                     )
                 self._bp_aux_loss_sum = 0.0
@@ -686,6 +758,34 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                 self._bp_n_post_frontend = 0
                 self._bp_n_input = 0
                 self._bp_step_count = 0
+            if self._bp_diag_step_count > 0:
+                d = float(self._bp_diag_step_count)
+                logs["bp/bias"] = self._bp_bias_sum / d
+                logs["bp/logit_mean"] = self._bp_logit_mean_sum / d
+                logs["bp/logit_std"] = self._bp_logit_std_sum / d
+                logs["bp/prob_mean"] = self._bp_prob_mean_sum / d
+                logs["bp/frac_sat_low"] = self._bp_frac_sat_low_sum / d
+                logs["bp/frac_sat_high"] = self._bp_frac_sat_high_sum / d
+                self._bp_diag_step_count = 0
+                self._bp_bias_sum = 0.0
+                self._bp_logit_mean_sum = 0.0
+                self._bp_logit_std_sum = 0.0
+                self._bp_prob_mean_sum = 0.0
+                self._bp_frac_sat_low_sum = 0.0
+                self._bp_frac_sat_high_sum = 0.0
+            if self._bp_grad_step_count > 0:
+                gd = float(self._bp_grad_step_count)
+                logs["bp/bias_grad"] = self._bp_bias_grad_sum / gd
+                logs["bp/mlp_last_w_grad"] = self._bp_mlp_last_w_grad_sum / gd
+                logs["bp/mlp_first_w_grad"] = self._bp_mlp_first_grad_sum / gd
+                logs["bp/pre_norm_grad"] = self._bp_pre_norm_grad_sum / gd
+                logs["bp/post_norm_grad"] = self._bp_post_norm_grad_sum / gd
+                self._bp_grad_step_count = 0
+                self._bp_bias_grad_sum = 0.0
+                self._bp_mlp_last_w_grad_sum = 0.0
+                self._bp_mlp_first_grad_sum = 0.0
+                self._bp_pre_norm_grad_sum = 0.0
+                self._bp_post_norm_grad_sum = 0.0
             if self._xa_step_count > 0:
                 denom_xa = float(self._xa_step_count)
                 for i in range(len(self._xa_delta_rms_sum)):
@@ -695,38 +795,36 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                         # Absolute ratio: XA's contribution to the residual
                         # stream entering the block.
                         logs[f"train/xa_delta_ratio_l{i}"] = d_mean / q_mean
-                    # Reference: the conformer layer's own residual delta at
-                    # the same depth, and XA's contribution as a fraction of
-                    # it. Self-calibrating — > 0.25 means XA is doing real
+                    # Relative strength: XA's contribution as a fraction of
+                    # the conformer layer's own residual delta at the same
+                    # depth. Self-calibrating — > 0.25 means XA is doing real
                     # work relative to a full conformer layer; < 0.05 means
                     # XA is small change vs the layer's own contribution.
                     n_ref = self._xa_ref_step_count[i]
                     if n_ref > 0:
                         rd_mean = self._xa_ref_delta_rms_sum[i] / float(n_ref)
-                        rq_mean = self._xa_ref_q_rms_sum[i] / float(n_ref)
-                        if rq_mean > 0:
-                            logs[f"train/xa_layer_delta_ratio_l{i}"] = rd_mean / rq_mean
                         if rd_mean > 0:
                             logs[f"train/xa_relative_strength_l{i}"] = d_mean / rd_mean
                 self._xa_delta_rms_sum = [0.0] * len(self._xa_delta_rms_sum)
                 self._xa_q_rms_sum = [0.0] * len(self._xa_q_rms_sum)
                 self._xa_ref_delta_rms_sum = [0.0] * len(self._xa_ref_delta_rms_sum)
-                self._xa_ref_q_rms_sum = [0.0] * len(self._xa_ref_q_rms_sum)
                 self._xa_ref_step_count = [0] * len(self._xa_ref_step_count)
                 self._xa_step_count = 0
         # Eval log boundary — emit empirical compression rate over the eval set.
         # The downsampler's eval-mode forward zeros out the binomial loss, so
-        # there's no ``eval/bp_aux_loss`` companion key — only the realized rate
-        # / compression are meaningful at eval time.
+        # there's no ``bp/eval_aux_loss`` companion key — only the realized
+        # rate / compression are meaningful at eval time. Eval keys live in
+        # the same ``bp/`` section as train-time keys, prefixed with ``eval_``
+        # so a single panel shows train vs eval side-by-side.
         if "eval_loss" in logs and self._eval_bp_n_post_frontend > 0:
-            logs["eval/bp_realized_prior"] = (
+            logs["bp/eval_realized_prior"] = (
                 self._eval_bp_n_boundaries / float(self._eval_bp_n_post_frontend)
             )
-            logs["eval/bp_compression"] = (
+            logs["bp/eval_compression"] = (
                 self._eval_bp_n_post_frontend / max(1, self._eval_bp_n_boundaries)
             )
             if self._eval_bp_n_input > 0:
-                logs["eval/bp_total_compression"] = (
+                logs["bp/eval_total_compression"] = (
                     self._eval_bp_n_input / max(1, self._eval_bp_n_boundaries)
                 )
         return super().log(logs, *args, **kwargs)

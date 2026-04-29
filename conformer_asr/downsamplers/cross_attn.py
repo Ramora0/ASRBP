@@ -66,18 +66,88 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     return x * cos + _rotate_half(x) * sin
 
 
+class SharedKVProjector(nn.Module):
+    """Encoder-level shared K/V projector for the interleaved cross-attn taps.
+
+    Every ``CrossAttnBlock`` inserted into ``MelConformerEncoder`` consumes
+    the same K/V source (``downsampler._post_cnn_features``) at the same K
+    positions (``arange(T_k)``), so applying ``LayerNorm + Linear(K) +
+    Linear(V) + RoPE(K)`` per block was repeated work. Hoisting these into
+    one module called once per encoder forward drops the per-tap marginal
+    cost ~5×: K/V projections at the high rate ``T_k`` are the single
+    biggest line item in a block, and at typical T_k = 4 × T_q they account
+    for ~80% of one block's compute.
+
+    Per-block freedom on the *query* side (own ``norm_q``, ``q_proj``,
+    ``out_proj``) is preserved — different taps can still attend to
+    different "views" of the shared K/V via their own query function.
+
+    Shape contract: ``forward(kv, k_positions)`` returns ``(K, V)`` of shape
+    ``(B, num_heads, T_k, head_dim)`` with K already RoPE-rotated, ready to
+    feed into ``F.scaled_dot_product_attention`` alongside a per-block Q.
+    """
+
+    def __init__(self, hidden: int, num_heads: int, rope_base: float = 10000.0):
+        super().__init__()
+        if hidden % num_heads != 0:
+            raise ValueError(f"hidden={hidden} not divisible by num_heads={num_heads}")
+        head_dim = hidden // num_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim={head_dim} must be even for RoPE")
+        self.num_heads = int(num_heads)
+        self.head_dim = head_dim
+        self.norm_kv = nn.LayerNorm(hidden)
+        self.k_proj = nn.Linear(hidden, hidden)
+        self.v_proj = nn.Linear(hidden, hidden)
+        inv_freq = 1.0 / (
+            float(rope_base)
+            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _rope_cos_sin(
+        self, positions: torch.Tensor, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # K positions in this codebase are always shared across the batch
+        # (``arange(T_k)``), so only the 1D path is needed here.
+        freqs = positions.to(self.inv_freq.dtype)[:, None] * self.inv_freq[None, :]
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = emb.cos().to(dtype)[None, None, :, :]
+        sin = emb.sin().to(dtype)[None, None, :, :]
+        return cos, sin
+
+    def forward(
+        self, kv: torch.Tensor, k_positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, T_k, _ = kv.shape
+        kv_n = self.norm_kv(kv)
+        K = self.k_proj(kv_n).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(kv_n).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+        cos_k, sin_k = self._rope_cos_sin(k_positions, K.dtype)
+        K = _apply_rope(K, cos_k, sin_k)
+        return K, V
+
+
 class CrossAttnBlock(nn.Module):
-    """Pre-norm cross-attention sublayer with RoPE on Q/K (no FFN).
+    """Pre-norm cross-attention sublayer (Q-side only) with RoPE on Q.
 
     Used by ``MelConformerEncoder`` as an **interleaved** block inserted
-    between conformer layers. The trailing position-wise FFN is omitted
-    because the immediately-downstream Conformer layer starts with a macaron
-    half-step FFN, which redoes the same work on the same residual stream.
+    between conformer layers. K/V projections, K-side LayerNorm, and K-side
+    RoPE have been factored out into ``SharedKVProjector`` and computed
+    once per encoder forward — every tap reads the same ``_post_cnn_features``
+    with identical k positions, so paying for K/V per block was repeated
+    work. ``forward`` consumes precomputed ``K, V`` tensors of shape
+    ``(B, H, T_k, head_dim)`` (K already RoPE-rotated).
 
-    RoPE positions are passed in by the caller so we can encode the *original*
-    post-frontend indices for both queries (``0, stride, ...``) and keys
-    (``0, 1, ..., T_cnn-1``). That makes the Q·K relative offset under RoPE
-    equal to the true frame-rate gap between a picked query and any key.
+    The trailing position-wise FFN is omitted because the immediately-
+    downstream Conformer layer starts with a macaron half-step FFN, which
+    redoes the same work on the same residual stream.
+
+    RoPE on Q is applied here per-block; ``q_positions`` may be a shared 1D
+    arange (static-stride downsamplers) or a per-sample 2D index (variable
+    selectors like ``BPXADownsampler``). The Q·K relative offset under RoPE
+    therefore tracks the true frame-rate gap between a picked query and any
+    key — including the per-sample case where the picked positions vary.
 
     The output projection is zero-init'd: at step 0 the block contributes
     nothing, so a fresh model degrades to a plain conformer with the
@@ -105,10 +175,7 @@ class CrossAttnBlock(nn.Module):
         self.attn_dropout = float(attn_dropout)
 
         self.norm_q = nn.LayerNorm(hidden)
-        self.norm_kv = nn.LayerNorm(hidden)
         self.q_proj = nn.Linear(hidden, hidden)
-        self.k_proj = nn.Linear(hidden, hidden)
-        self.v_proj = nn.Linear(hidden, hidden)
         self.out_proj = nn.Linear(hidden, hidden)
         self.resid_dropout = nn.Dropout(dropout)
 
@@ -131,36 +198,40 @@ class CrossAttnBlock(nn.Module):
     def _rope_cos_sin(
         self, positions: torch.Tensor, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # positions: (T,) long, on device. Returns cos, sin of shape
-        # (1, 1, T, head_dim), matching dtype for the multiply against (B, H, T, head_dim).
-        freqs = positions.to(self.inv_freq.dtype)[:, None] * self.inv_freq[None, :]  # (T, head_dim/2)
-        emb = torch.cat([freqs, freqs], dim=-1)  # (T, head_dim) — halves duplicated for _rotate_half
-        cos = emb.cos().to(dtype)[None, None, :, :]
-        sin = emb.sin().to(dtype)[None, None, :, :]
+        # positions: ``(T,)`` long for shared positions across the batch, OR
+        # ``(B, T)`` long for per-sample positions (used by BP+XA's variable
+        # selector — Q's RoPE position is the predicted post-CNN frame index,
+        # different per sample).
+        # Returns cos, sin shaped ``(1, 1, T, head_dim)`` (shared) or
+        # ``(B, 1, T, head_dim)`` (per-batch), both broadcasting against
+        # ``Q: (B, H, T, head_dim)``. dtype matches the multiply target.
+        if positions.dim() == 1:
+            freqs = positions.to(self.inv_freq.dtype)[:, None] * self.inv_freq[None, :]  # (T, head_dim/2)
+            emb = torch.cat([freqs, freqs], dim=-1)  # (T, head_dim) — halves duplicated for _rotate_half
+            cos = emb.cos().to(dtype)[None, None, :, :]
+            sin = emb.sin().to(dtype)[None, None, :, :]
+        else:
+            freqs = positions.to(self.inv_freq.dtype)[..., None] * self.inv_freq[None, None, :]  # (B, T, head_dim/2)
+            emb = torch.cat([freqs, freqs], dim=-1)  # (B, T, head_dim)
+            cos = emb.cos().to(dtype)[:, None, :, :]
+            sin = emb.sin().to(dtype)[:, None, :, :]
         return cos, sin
 
     def forward(
         self,
         q: torch.Tensor,
-        kv: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
         q_positions: torch.Tensor,
-        k_positions: torch.Tensor,
         attn_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         B, T_q, D = q.shape
-        T_k = kv.shape[1]
 
         q_n = self.norm_q(q)
-        kv_n = self.norm_kv(kv)
-
         Q = self.q_proj(q_n).view(B, T_q, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.k_proj(kv_n).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.v_proj(kv_n).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
 
         cos_q, sin_q = self._rope_cos_sin(q_positions, Q.dtype)
-        cos_k, sin_k = self._rope_cos_sin(k_positions, K.dtype)
         Q = _apply_rope(Q, cos_q, sin_q)
-        K = _apply_rope(K, cos_k, sin_k)
 
         out = F.scaled_dot_product_attention(
             Q, K, V,

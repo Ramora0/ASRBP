@@ -1,9 +1,14 @@
-"""Cross-attention downsampler.
+"""Cross-attention downsampler — feature extractor only.
 
 Full Conv2d stack (strided frontend + dilated layers, mel axis preserved
-throughout) → flatten + project → pick every Nth → cross-attend the picked
-subset to the full post-conv sequence, then hand the refined queries to the
-encoder.
+throughout) → flatten + project → strided pick. Outputs the picked subset
+directly; the cross-attention refinement *itself* lives in
+``MelConformerEncoder`` as **interleaved** blocks injected between conformer
+layers (see ``cross_attn_layer_indices``). This module's job is to produce:
+
+  - the picked-rate query stream (the encoder's input)
+  - the cached post-CNN feature map ``_post_cnn_features`` (K/V source for
+    every interleaved XA block downstream)
 
 Pipeline inside ``forward``:
   1. ``convs``: a single ``nn.Sequential`` of Conv2d layers — same shape as
@@ -16,29 +21,17 @@ Pipeline inside ``forward``:
      layer. The valid-padding choice is what makes the dilated stack +
      final strided pick the exact à trous re-parameterization of a
      stride-2 cascade: with pad=0 the kept output positions read the same
-     input windows as the equivalent strided-cascade outputs (see
-     ``scripts/verify_xa_c16x_equivalence.py``). Mel stays separate through
-     every conv layer (4 layers total at default), so deep cross-mel
-     interactions are learned just like c16x.
+     input windows as the equivalent strided-cascade outputs. Mel stays
+     separate through every conv layer (4 layers total at default), so
+     deep cross-mel interactions are learned just like c16x.
   2. Flatten the mel axis and apply a single ``Linear(hidden * mel_after,
      hidden)`` — placed after ALL convs, same as c16x's stem. Yields
      ``(B, T_cnn, hidden)`` at the post-frontend rate (4× downsampled
-     by default, ≈25 Hz).
-  3. Pick ``out[:, ::stride, :]`` to seed queries. With the default
-     ``stride=4`` on top of the 4× conv stem, total downsampling is 16×
-     (≈6.25 Hz on 100 Hz mels).
-  4. ``num_layers`` pre-norm cross-attention blocks: queries = the picked
-     subset (residually updated), keys/values = the full post-conv
-     sequence. RoPE is applied to Q/K with positions taken from the
-     **original post-frontend indices** — queries get ``[0, stride, 2*stride,
-     ...]``, keys get ``[0, 1, ..., T_cnn-1]`` — so the relative offset
-     under RoPE matches the true frame-rate gap. Padded positions are
-     masked out of attention. The output projection is zero-init'd, so at
-     step 0 the cross-attn contributes nothing — the model behaves as
-     "full Conv2d stack → strided pick → conformer", which is structurally
-     a 4-Conv2d stem plus a strided slice (the only difference vs c16x:
-     the slice replaces c16x's last stride-2 conv).
-  5. Return the refined queries.
+     by default, ≈25 Hz). Stash on ``_post_cnn_features``.
+  3. Pick ``out[:, ::stride, :]`` to seed the encoder input. With the
+     default ``stride=4`` on top of the 4× conv stem, total downsampling
+     is 16× (≈6.25 Hz on 100 Hz mels). Return the picked tensor — no
+     in-downsampler attention refinement.
 
 Output length is a pure function of input length (strided convs apply
 the standard ``(l-3)//s+1`` shrink; valid-pad dilated convs subtract
@@ -73,17 +66,24 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     return x * cos + _rotate_half(x) * sin
 
 
-class _CrossAttnBlock(nn.Module):
+class CrossAttnBlock(nn.Module):
     """Pre-norm cross-attention sublayer with RoPE on Q/K (no FFN).
 
-    The trailing position-wise FFN is omitted because the immediately-downstream
-    Conformer layer starts with a macaron half-step FFN, which redoes the same
-    work on the same residual stream.
+    Used by ``MelConformerEncoder`` as an **interleaved** block inserted
+    between conformer layers. The trailing position-wise FFN is omitted
+    because the immediately-downstream Conformer layer starts with a macaron
+    half-step FFN, which redoes the same work on the same residual stream.
 
     RoPE positions are passed in by the caller so we can encode the *original*
     post-frontend indices for both queries (``0, stride, ...``) and keys
     (``0, 1, ..., T_cnn-1``). That makes the Q·K relative offset under RoPE
     equal to the true frame-rate gap between a picked query and any key.
+
+    The output projection is zero-init'd: at step 0 the block contributes
+    nothing, so a fresh model degrades to a plain conformer with the
+    downsampler's strided-pick output as its input. The XA blocks then learn
+    their contribution as training proceeds (track via
+    ``train/xa_delta_ratio_l{i}`` in W&B).
     """
 
     def __init__(
@@ -168,19 +168,32 @@ class _CrossAttnBlock(nn.Module):
             dropout_p=self.attn_dropout if self.training else 0.0,
         )
         out = out.transpose(1, 2).reshape(B, T_q, D)
-        q = q + self.resid_dropout(self.out_proj(out))
-        return q
+        delta = self.resid_dropout(self.out_proj(out))
+        # Stash batch-mean RMS of the residual contribution and the
+        # pre-update query stream so the trainer can log how much each XA
+        # layer is actually shifting the residual stream. Detached scalars
+        # only — no graph retention. Fp32 for the reduction so bf16 autocast
+        # doesn't clip the magnitude.
+        with torch.no_grad():
+            self._last_delta_rms = float(delta.detach().float().pow(2).mean().sqrt().item())
+            self._last_q_rms = float(q.detach().float().pow(2).mean().sqrt().item())
+        return q + delta
 
 
 class CrossAttnDownsampler(Downsampler):
-    """Full Conv2d stack (mel preserved) → projection → strided pick → cross-attn.
+    """Full Conv2d stack (mel preserved) → projection → strided pick.
+
+    Cross-attention refinement is no longer part of this module — it lives
+    on ``MelConformerEncoder`` as interleaved blocks between conformer
+    layers (see ``cross_attn_layer_indices`` on ``ModelConfig``). This
+    downsampler produces both the encoder input (the picked stream) and
+    the K/V source for those interleaved blocks (``_post_cnn_features``).
 
     Args:
         n_mels: Mel-bin count.
         hidden: Channel count for every Conv2d layer AND the post-conv hidden
-            size after projection (also the cross-attention dim).
-        dropout: Dropout after the post-conv projection AND on the attention
-            sublayer's residual branch.
+            size after projection.
+        dropout: Dropout after the post-conv projection.
         strides: Per-layer ``[time, mel]`` strides for the strided portion of
             the conv stack (same convention as ``Conv2dDownsampler``).
             Default ``[[2,2],[2,2]]`` matches c4x — 4× time reduction.
@@ -195,13 +208,9 @@ class CrossAttnDownsampler(Downsampler):
             stays separate through every conv layer, so cross-mel
             interactions are learned at depth like c16x. ``()`` disables
             this block.
-        stride: Subsample factor applied after the conv stack to seed the
-            cross-attention queries. With the default ``stride=4`` on top of
-            the 4× strided stem, total compression is 16×.
-        num_heads: Cross-attention heads.
-        num_layers: Number of cross-attention blocks. Each block re-attends
-            the (residually-updated) queries to the same key/value sequence.
-        attn_dropout: Dropout applied inside ``scaled_dot_product_attention``.
+        stride: Subsample factor applied after the conv stack. With the
+            default ``stride=4`` on top of the 4× strided stem, total
+            compression is 16×.
     """
 
     def __init__(
@@ -213,19 +222,10 @@ class CrossAttnDownsampler(Downsampler):
         strides: Sequence[Sequence[int]] = ((2, 2), (2, 2)),
         dilations: Sequence[int] = (2, 2),
         stride: int = 4,
-        num_heads: int = 4,
-        num_layers: int = 1,
-        attn_dropout: float = 0.0,
     ):
         super().__init__()
         if stride < 1:
             raise ValueError(f"stride must be >= 1, got {stride}")
-        if num_layers < 0:
-            raise ValueError(f"num_layers must be >= 0, got {num_layers}")
-        # num_layers=0 disables the cross-attn block entirely → the downsampler
-        # becomes a pure conv-stack + strided-pick feature extractor (useful
-        # for ablating whether downstream slowdowns originate from the conv
-        # stack or from the cross-attn block).
         self.n_mels = int(n_mels)
         self.hidden = int(hidden)
         self.stride = int(stride)
@@ -287,16 +287,6 @@ class CrossAttnDownsampler(Downsampler):
         self.proj = nn.Linear(int(hidden) * self.mel_after, int(hidden))
         self.proj_dropout = nn.Dropout(float(dropout))
 
-        self.layers = nn.ModuleList([
-            _CrossAttnBlock(
-                hidden=int(hidden),
-                num_heads=int(num_heads),
-                dropout=float(dropout),
-                attn_dropout=float(attn_dropout),
-            )
-            for _ in range(int(num_layers))
-        ])
-
     def _post_conv_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
         """Per-sample valid time length after the conv stack.
 
@@ -351,40 +341,19 @@ class CrossAttnDownsampler(Downsampler):
         h = x.permute(0, 2, 1, 3).reshape(bsz, T_cnn, hidden_dim * m_out)
         h = self.proj(h)
         h = self.proj_dropout(h)
-        device = h.device
 
-        # Stash the post-CNN / pre-pick tensor so an outer wrapper (e.g.
-        # ``ConformerAEDWithCTC`` with ``ctc_input='post_cnn'``) can attach a
-        # CTC head at the higher (pre-pick) frame rate without re-running the
-        # conv stack. Plain attribute, kept out of state_dict.
+        # Stash the post-CNN / pre-pick tensor. Two consumers downstream:
+        #   - ``ConformerAEDWithCTC`` with ``ctc_input='post_cnn'`` taps it
+        #     for a higher-rate CTC head.
+        #   - ``MelConformerEncoder`` reads it as the K/V source for every
+        #     interleaved cross-attn block in the conformer stack.
+        # Plain attribute, kept out of state_dict.
         self._post_cnn_features = h
 
-        # 3. Build a key-padding mask covering padded post-conv positions.
-        # SDPA bool-mask convention: True = participates in attention.
-        attn_mask: torch.Tensor | None = None
-        if input_lengths is not None:
-            post_lens = self._post_conv_lengths(input_lengths.to(device)).long()
-            post_lens = post_lens.clamp(min=1, max=T_cnn)
-            pos = torch.arange(T_cnn, device=device).unsqueeze(0)
-            valid = pos < post_lens.unsqueeze(1)  # (B, T_cnn)
-            attn_mask = valid[:, None, None, :]  # (B, 1, 1, T_k)
-
-        # 4. Pick every ``stride``-th frame as queries. Track which post-conv
-        # indices we picked — those are the RoPE positions for the queries,
-        # so the relative offset Q[i] - K[j] under RoPE matches the true gap
-        # between picked frame ``i*stride`` and key frame ``j``.
+        # 3. Pick every ``stride``-th post-conv frame as the encoder input.
+        # The interleaved cross-attn blocks downstream re-attend the
+        # conformer's residual stream against the full ``h`` — which is why
+        # the K/V cache above must stay live through the whole encoder pass.
         if self.stride > 1:
-            q = h[:, ::self.stride, :]
-            q_positions = torch.arange(0, T_cnn, self.stride, device=device)
-        else:
-            q = h
-            q_positions = torch.arange(T_cnn, device=device)
-        k_positions = torch.arange(T_cnn, device=device)
-
-        # 5. Cross-attend. With zero-init out_proj, this is the identity at
-        # step 0 — the model behaves as "convs + strided pick + conformer"
-        # until cross-attn weights move.
-        for layer in self.layers:
-            q = layer(q, h, q_positions, k_positions, attn_mask)
-
-        return q
+            return h[:, ::self.stride, :]
+        return h

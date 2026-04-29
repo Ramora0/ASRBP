@@ -349,7 +349,10 @@ def main() -> None:
         bp_stats_fn = getattr(bp_stats_fn, "last_stats", None) if bp_stats_fn is not None else None
         if bp_stats_fn is not None:
             stats = bp_stats_fn()
-            if stats is not None:
+            # Branch on key presence — XA also exposes ``last_stats()`` but
+            # with a different schema (``xa_delta_rms``/``xa_q_rms``); only
+            # the BP path drives the compression bookkeeping below.
+            if stats is not None and "n_boundaries" in stats:
                 bp_n_boundaries += stats["n_boundaries"]
                 bp_n_post_frontend += stats["n_post_frontend"]
                 bp_n_input += stats["n_input"]

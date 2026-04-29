@@ -17,17 +17,18 @@ model:
   n_mels: 80
   n_fft: 400
   hop_length: 160
-  # Cross-attention downsampler. C4x-style Conv2d frontend (4× time stem)
-  # produces a 25 Hz post-frontend sequence. CTC supervises right here (see
-  # ``ctc_input: post_cnn`` below) — i.e. CTC trains the conv stem at the
-  # higher pre-pick rate where alignment is easiest.
+  # Cross-attention downsampler — feature extractor only. C4x-style Conv2d
+  # frontend (4× time stem) + dilated layers produces a 25 Hz post-CNN
+  # sequence. CTC supervises right there (see ``ctc_input: post_cnn``
+  # below) — CTC trains the conv stem at the higher pre-pick rate where
+  # alignment is easiest. The strided pick (every 8th post-CNN frame) is
+  # the encoder input at ≈3.125 Hz (32× total).
   #
-  # Then ``stride: 8`` picks every 8th post-frontend frame as cross-attn
-  # queries against the full 25 Hz sequence — net rate to the conformer
-  # ≈3.125 Hz (32× total). Two cross-attn layers (vs. 1 in xa_16x): at
-  # stride 8 the queries are half as dense as in xa_16x, so an extra block
-  # gives them more room to gather context from the keys before the
-  # conformer stack.
+  # Cross-attn refinement is interleaved between conformer layers (see
+  # ``cross_attn_layer_indices``) — at this compression each compressed
+  # token is genuinely missing detail, so periodic taps that re-attend the
+  # residual stream to the 25 Hz post-CNN cache are the main lever for
+  # information recovery.
   #
   # Dilation schedule [1, 2] is the à trous equivalent of two extra stride-2
   # layers after the strided frontend: at jump=4, d=1 reads 3 adjacent
@@ -36,18 +37,21 @@ model:
   # the post-CNN (pre-pick) stage — same RF c16x has, applied here at the
   # 25 Hz CTC tap. The pick of 8 then adds an additional 8× compression
   # (no aggregation, just a slice) for the final 32× rate to the conformer.
-  #
-  # Trailing FFN is intentionally absent in the cross-attn block (next
-  # conformer layer's macaron half-step FFN already does that work).
   downsampler:
     type: cross_attn
     kwargs:
       strides: [[2, 2], [2, 2]]
       dilations: [1, 2]
       stride: 8
-      num_heads: 4
-      num_layers: 2
-      attn_dropout: 0.0
+  # Interleaved cross-attention. All four taps in the first half — at 32×
+  # compression each picked frame stands in for 8 post-CNN frames of
+  # detail, so refreshing the residual stream during early acoustic /
+  # phonetic processing is the highest-leverage place to spend the tap.
+  # Same indices as xa_16x for direct comparison; revisit if 32× behaves
+  # differently from 16× under the same schedule.
+  cross_attn_layer_indices: [2, 4, 6, 8]
+  cross_attn_num_heads: 4
+  cross_attn_dropout: 0.0
   decoder_d_model: 256
   decoder_layers: 4
   decoder_attention_heads: 4

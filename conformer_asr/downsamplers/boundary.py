@@ -117,6 +117,7 @@ class BoundaryPredictorDownsampler(Downsampler):
         loss_weight: float = 10.0,
         boundary_mode: str = "learned",
         bp_hidden: int | None = None,
+        init_prior_bias: bool = True,
     ):
         super().__init__()
         if boundary_mode not in {"learned", "all", "alternating"}:
@@ -151,7 +152,9 @@ class BoundaryPredictorDownsampler(Downsampler):
             nn.GELU(),
             nn.Linear(bp_hidden, 1),
         )
-        self._init_prior_bias()
+        self.init_prior_bias_enabled = bool(init_prior_bias)
+        if self.init_prior_bias_enabled:
+            self._init_prior_bias()
         self.mlp_dropout = nn.Dropout(p=mlp_dropout)
         # LayerNorm the pooled output before it enters the encoder. Without
         # this, the residual-stream scale at the encoder input is a direct
@@ -181,8 +184,11 @@ class BoundaryPredictorDownsampler(Downsampler):
     def post_parent_init(self) -> None:
         # The parent encoder's HF post_init() recursively re-inits every
         # nn.Linear under this module — including boundary_mlp[-1] — wiping
-        # the prior-targeted init done in __init__. Re-apply it here.
-        self._init_prior_bias()
+        # the prior-targeted init done in __init__. Re-apply it here, unless
+        # the user explicitly disabled the prior-bias init (debugging the
+        # role of the initial bias in collapse dynamics).
+        if self.init_prior_bias_enabled:
+            self._init_prior_bias()
 
     # ------------------------------------------------------------- public API
 
@@ -335,10 +341,14 @@ class BoundaryPredictorDownsampler(Downsampler):
         actual_lens: torch.Tensor,
     ) -> torch.Tensor:
         # Per-sample -log P(num_boundaries | Binomial(n=actual_lens, p=prior)),
-        # length-normalized then averaged over the batch.
+        # length-normalized then averaged over the batch. Clamp the prior
+        # away from {0, 1} — at the endpoints the Binomial is degenerate
+        # (log_prob is -inf for any k != n*prior) and would NaN-poison the
+        # loss for typical batches where k drifts off the boundary.
+        clamped_prior = min(max(self.prior, 1e-4), 1 - 1e-4)
         binomial = torch.distributions.binomial.Binomial(
             total_count=actual_lens.float(),
-            probs=torch.tensor([self.prior], device=boundaries.device),
+            probs=torch.tensor([clamped_prior], device=boundaries.device),
         )
         num_boundaries = boundaries.sum(dim=1)
         per_sample = -binomial.log_prob(num_boundaries) / actual_lens.float().clamp(min=1)

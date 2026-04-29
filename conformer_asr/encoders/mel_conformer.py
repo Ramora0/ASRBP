@@ -9,7 +9,11 @@ Takes a ``(B, T_mel, n_mels)`` log-Mel spectrogram (see
      with zero-fill (see ``encoders/preproc.py``). No-op outside training
      or before ``spec_aug_warmup_steps``.
   3. A swappable ``Downsampler`` (defaults to 2× ``Conv2d(k=3, s=2)``).
-  4. The existing HF ``Wav2Vec2ConformerEncoder`` blocks.
+  4. The HF ``Wav2Vec2ConformerEncoder`` blocks, optionally interleaved
+     with ``CrossAttnBlock`` taps that re-attend the residual stream to
+     the downsampler's cached post-CNN feature map (see
+     ``cross_attn_layer_indices``). When the index list is empty the
+     stock encoder is used as-is.
 
 Slots into ``SpeechEncoderDecoderModel`` by exposing:
   - ``.config.hidden_size`` (inherited from ``Wav2Vec2ConformerConfig``)
@@ -25,15 +29,19 @@ care which concrete classes they are, just the interface contracts.
 """
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 import torch.nn as nn
 from transformers import Wav2Vec2ConformerConfig
+from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.wav2vec2_conformer.modeling_wav2vec2_conformer import (
     Wav2Vec2ConformerEncoder,
     Wav2Vec2ConformerPreTrainedModel,
 )
 
 from ..downsamplers.base import Downsampler
+from ..downsamplers.cross_attn import CrossAttnBlock
 from .preproc import InputNormalization, SpecAugment
 from .sdpa_patch import install_sdpa_attention_patch
 
@@ -48,6 +56,10 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         config: Wav2Vec2ConformerConfig,
         downsampler: Downsampler,
         spec_augment: SpecAugment,
+        *,
+        cross_attn_layer_indices: Sequence[int] = (),
+        cross_attn_num_heads: int = 4,
+        cross_attn_dropout: float = 0.0,
     ):
         super().__init__(config)
         self.n_mels = int(config.n_mels)
@@ -57,12 +69,51 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         self.downsampler = downsampler
         self.encoder = Wav2Vec2ConformerEncoder(config)
 
+        # Interleaved cross-attn taps. Sorted + de-duplicated so the manual
+        # encoder loop can iterate the block list in lockstep with the
+        # conformer-layer index. Empty list ⇒ stock-encoder fast path.
+        idx = sorted({int(i) for i in cross_attn_layer_indices})
+        if idx and (idx[0] < 1 or idx[-1] > config.num_hidden_layers):
+            raise ValueError(
+                f"cross_attn_layer_indices must lie in [1, {config.num_hidden_layers}], "
+                f"got {idx}"
+            )
+        self.cross_attn_layer_indices: tuple[int, ...] = tuple(idx)
+        if idx:
+            # ``_post_cnn_features`` is set at forward time, not __init__ —
+            # gate on the static signal (``post_cnn_lengths`` method) which
+            # only the cross_attn downsampler exposes today.
+            if not hasattr(self.downsampler, "post_cnn_lengths"):
+                raise ValueError(
+                    f"Interleaved cross-attention requires a downsampler that "
+                    f"exposes a post-CNN K/V cache; "
+                    f"{type(self.downsampler).__name__} does not."
+                )
+            self.cross_attn_blocks = nn.ModuleList([
+                CrossAttnBlock(
+                    hidden=config.hidden_size,
+                    num_heads=cross_attn_num_heads,
+                    dropout=cross_attn_dropout,
+                    attn_dropout=cross_attn_dropout,
+                )
+                for _ in idx
+            ])
+        else:
+            self.cross_attn_blocks = nn.ModuleList()
+
         self.post_init()
         # post_init() recurses ``_init_weights`` over every submodule, which
         # silently overwrites any custom parameter init the downsampler did
         # in its own __init__ (e.g. biasing the boundary predictor toward a
         # target prior). Give the downsampler a chance to restore it.
         self.downsampler.post_parent_init()
+        # Same hazard for the cross-attn blocks: ``CrossAttnBlock.__init__``
+        # zero-inits ``out_proj`` so the first forward is a residual
+        # passthrough, but ``_init_weights`` re-fills the linear with a
+        # normal init and erases that. Restore.
+        for block in self.cross_attn_blocks:
+            nn.init.zeros_(block.out_proj.weight)
+            nn.init.zeros_(block.out_proj.bias)
 
     def _get_feature_vector_attention_mask(
         self,
@@ -146,10 +197,142 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         if attention_mask is not None:
             encoder_attention_mask = self._get_feature_vector_attention_mask(t_out, attention_mask)
 
-        return self.encoder(
-            x,
+        if not self.cross_attn_blocks:
+            return self.encoder(
+                x,
+                attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+        return self._encoder_with_xa(
+            hidden_states=x,
             attention_mask=encoder_attention_mask,
+            pre_stem_attention_mask=attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+
+    def _encoder_with_xa(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.BoolTensor | None,
+        pre_stem_attention_mask: torch.LongTensor | None,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+    ):
+        """Manual conformer loop with cross-attn taps injected after each
+        index in ``self.cross_attn_layer_indices`` (1-indexed).
+
+        Replicates ``Wav2Vec2ConformerEncoder.forward`` (HF transformers
+        v4.x) — input dropout, rotary positional embeddings, per-layer
+        layerdrop, final ``layer_norm`` — and drops a ``CrossAttnBlock``
+        in between layers when their (1-indexed) position matches.
+
+        The XA Q/K positions are taken from the *original post-CNN
+        timeline* so RoPE phases match the true frame-rate gap between a
+        picked query at conformer index ``i`` and a key at post-CNN index
+        ``j``. K/V is the downsampler's cached ``_post_cnn_features``.
+        """
+        encoder = self.encoder
+
+        # K/V tensor and its (B, T_k) bool padding mask. The downsampler set
+        # ``_post_cnn_features`` on its forward call earlier in this same
+        # forward — read it here without re-running the conv stack.
+        kv = self.downsampler._post_cnn_features
+        kv_mask: torch.Tensor | None = None
+        if pre_stem_attention_mask is not None:
+            kv_mask = self._get_post_cnn_attention_mask(kv.shape[1], pre_stem_attention_mask)
+            kv_mask = kv_mask[:, None, None, :]  # SDPA shape (B, 1, 1, T_k)
+
+        # Q/K position indices in post-CNN coordinates. The downsampler's
+        # ``stride`` attribute gives the picked-frame spacing.
+        stride = int(getattr(self.downsampler, "stride", 1))
+        T_k = kv.shape[1]
+        T_q = hidden_states.shape[1]
+        device = hidden_states.device
+        q_positions = torch.arange(0, T_q * stride, stride, device=device)[:T_q]
+        k_positions = torch.arange(T_k, device=device)
+
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attentions = () if output_attentions else None
+
+        # Match HF's mask handling: zero out padded tokens, then build the
+        # additive (B, 1, T_q, T_q) extended mask self-attention expects.
+        ext_attn_mask: torch.Tensor | None = None
+        if attention_mask is not None:
+            expand_attention_mask = attention_mask.unsqueeze(-1).repeat(
+                1, 1, hidden_states.shape[2]
+            )
+            hidden_states = hidden_states.masked_fill(~expand_attention_mask, 0.0)
+            ext_attn_mask = 1.0 - attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)
+            ext_attn_mask = ext_attn_mask * torch.finfo(hidden_states.dtype).min
+            ext_attn_mask = ext_attn_mask.expand(
+                ext_attn_mask.shape[0], 1, ext_attn_mask.shape[-1], ext_attn_mask.shape[-1]
+            )
+
+        hidden_states = encoder.dropout(hidden_states)
+        rel_pos_emb = (
+            encoder.embed_positions(hidden_states) if encoder.embed_positions is not None else None
+        )
+
+        # 1-indexed → 0-indexed lookup of "which XA block fires after layer i".
+        xa_after = {idx - 1: i for i, idx in enumerate(self.cross_attn_layer_indices)}
+
+        for i, layer in enumerate(encoder.layers):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            dropout_probability = torch.rand([])
+            skip_the_layer = self.training and dropout_probability < encoder.config.layerdrop
+            if not skip_the_layer:
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=ext_attn_mask,
+                    relative_position_embeddings=rel_pos_emb,
+                    output_attentions=output_attentions,
+                )
+                hidden_states = layer_outputs[0]
+            else:
+                layer_outputs = (None, None)
+
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (layer_outputs[1],)
+
+            if i in xa_after:
+                block = self.cross_attn_blocks[xa_after[i]]
+                hidden_states = block(hidden_states, kv, q_positions, k_positions, kv_mask)
+
+        hidden_states = encoder.layer_norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(
+                v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None
+            )
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
+
+    def last_stats(self) -> dict | None:
+        """Per-XA-tap residual-magnitude snapshot from the most-recent
+        ``forward``. Returns ``None`` when no interleaved XA blocks are
+        configured or before the first forward.
+
+        Trainer's stat accumulator branches on key presence, so the
+        ``xa_*`` namespace stays disjoint from BP's
+        ``n_boundaries`` / ``aux_loss`` keys.
+        """
+        if not self.cross_attn_blocks:
+            return None
+        deltas = [getattr(b, "_last_delta_rms", None) for b in self.cross_attn_blocks]
+        q_rms = [getattr(b, "_last_q_rms", None) for b in self.cross_attn_blocks]
+        if any(v is None for v in deltas):
+            return None
+        return {"xa_delta_rms": deltas, "xa_q_rms": q_rms}

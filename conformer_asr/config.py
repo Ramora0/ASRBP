@@ -96,6 +96,17 @@ class ModelConfig:
     # / time dim either way (Conformer doesn't change T), so the CTC head
     # itself is identical and checkpoints round-trip between modes.
     ctc_input: str = "encoder"
+    # Interleaved cross-attention. After each conformer layer index listed
+    # here (1-indexed, valid range ``[1, encoder_num_hidden_layers]``), insert
+    # a ``CrossAttnBlock`` that re-attends the residual stream to the
+    # downsampler's cached post-CNN feature map (the higher-rate K/V before
+    # the strided pick). Empty list ⇒ no interleaved cross-attention (plain
+    # conformer running on the downsampler's picked output). Only meaningful
+    # when ``downsampler.type == "cross_attn"`` since other downsamplers
+    # don't expose a post-CNN K/V cache.
+    cross_attn_layer_indices: list[int] = field(default_factory=list)
+    cross_attn_num_heads: int = 4
+    cross_attn_dropout: float = 0.0
 
 
 @dataclass

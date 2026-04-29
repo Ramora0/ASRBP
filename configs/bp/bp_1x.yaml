@@ -3,8 +3,8 @@ model:
   # for the registered options.
   encoder_type: conformer
   decoder_type: bart
-  # Conformer-M sized to match configs/cnns/c8x.yaml so the BP run is a
-  # like-for-like comparison vs. a static 8× stem.
+  # Conformer-M sized to match configs/cnns/c4x.yaml so the BP-1x run is a
+  # like-for-like comparison vs. a static 4× stem (no BP compression).
   encoder_hidden_size: 256
   encoder_num_hidden_layers: 16
   encoder_num_attention_heads: 4
@@ -17,25 +17,34 @@ model:
   n_mels: 80
   n_fft: 400
   hop_length: 160
-  # Boundary-predictor downsampler. Standard 4× Conv2d frontend
-  # ([2,2] + [2,2]) feeds the BP block at 25 Hz; with prior=0.5 the BP
-  # targets a further 2× compression ⇒ ~12.5 Hz on average, i.e. 8×
-  # total. Sharp temp=0.1 keeps the RelaxedBernoulli sample close to the
-  # hard threshold while still passing gradients through the straight-
-  # through estimator. The binomial-prior auxiliary loss (-log P of
-  # realized boundary count under Binomial(n=actual_lens, p=prior)) is
-  # added to the training total inside ConformerAEDWithCTC.forward via
-  # the ``aux_loss`` hook.
-  # See conformer_asr/downsamplers/boundary.py for the full pipeline.
+  # Diagnostic BP run with prior=1.0 (target = "every frame is a boundary",
+  # i.e. no BP compression). 4× Conv2d frontend feeds the BP at 25 Hz; the
+  # learned BP MLP still runs and the binomial aux loss is still applied,
+  # but the prior pulls the count toward n_valid rather than toward a
+  # fraction of it. Compared to bp_8x.yaml this isolates whether the
+  # collapse dynamics depend on the target compression ratio: if the BP
+  # still drifts toward 1 boundary even when the loss is asking for n,
+  # the bug isn't about the prior value — it's structural.
+  #
+  # ``init_prior_bias: false`` skips the manual zero-weight + logit(prior)
+  # initialization on boundary_mlp[-1], leaving HF's default linear init
+  # in place. Lets us check whether the artificial saturated-bias start
+  # is contributing to the collapse trajectory.
+  #
+  # The Binomial(p=prior) is degenerate at prior=1 (log_prob=-inf for any
+  # k<n); _binomial_loss clamps the prior to (1e-4, 1-1e-4) before
+  # constructing the distribution, so prior=1.0 is effectively prior≈0.9999
+  # for the loss term while the YAML stays declarative.
   downsampler:
     type: boundary_predictor
     kwargs:
       strides: [[2, 2], [2, 2]]
-      prior: 0.5
+      prior: 1.0
       temp: 0.2
       mlp_dropout: 0.1
       loss_weight: 10.0
       boundary_mode: learned
+      init_prior_bias: false
   decoder_d_model: 256
   decoder_layers: 4
   decoder_attention_heads: 4
@@ -66,7 +75,7 @@ data:
   cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache
 
 train:
-  output_dir: outputs/run-bp-8x
+  output_dir: outputs/run-bp-1x
   per_device_train_batch_size: 64
   per_device_eval_batch_size: 8
   effective_batch_size: 256
@@ -100,7 +109,7 @@ wandb:
   enabled: true
   project: conformer-asr-librispeech
   entity: null
-  run_name: conformer-bp-8x
+  run_name: conformer-bp-1x
   group: null
   tags: []
   notes: ""

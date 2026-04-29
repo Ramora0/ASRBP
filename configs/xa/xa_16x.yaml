@@ -18,25 +18,21 @@ model:
   n_mels: 80
   n_fft: 400
   hop_length: 160
-  # Cross-attention downsampler. C4x-style Conv2d frontend (4× time stem)
-  # produces a 25 Hz post-frontend sequence, then we pick every 4th frame as
-  # queries and let one cross-attention block re-attend those queries against
-  # the full post-frontend sequence to inject local temporal context. Net
-  # frame rate to the conformer ≈6.25 Hz (16× total).
+  # Cross-attention downsampler — feature extractor only. C4x-style Conv2d
+  # frontend (4× time stem) + dilated layers produces a 25 Hz post-CNN
+  # sequence; the strided pick (every 4th frame) is the encoder's input at
+  # ≈6.25 Hz. The cross-attn refinement itself is *interleaved* between
+  # conformer layers — see ``cross_attn_layer_indices`` below — so this
+  # downsampler now just owns the CNN stack and the K/V cache that every
+  # interleaved tap reads from.
   #
   # Dilation schedule [1, 2] is the à trous equivalent of c16x's remaining
   # stride-2, stride-2 cascade after the strided frontend: at jump=4, a
   # d=1 kernel reads 3 adjacent layer-2 frames (= what c16x layer 3 reads),
   # and a d=2 kernel on top of that replicates layer 4. RF = 31 input
   # frames after picking every 4th — exactly matches c16x's pure-stride
-  # stem with dense (no-gap) coverage. (Earlier default [2, 2] gave a
-  # 39-frame sparse RF with every-other-frame holes — wrong for replicating
-  # a stride cascade.)
-  #
-  # Trailing FFN is intentionally absent in the cross-attn block: the next
-  # conformer layer starts with a macaron half-step FFN, which redoes the
-  # same per-token nonlinear processing on the same residual stream. Keeping
-  # one nets ~0.5M extra params per cross-attn layer for ~zero gain.
+  # stem with dense coverage. This is what gives the interleaved XA blocks
+  # something rich to attend to.
   #
   # See conformer_asr/downsamplers/cross_attn.py for the full pipeline.
   downsampler:
@@ -45,9 +41,18 @@ model:
       strides: [[2, 2], [2, 2]]
       dilations: [1, 2]
       stride: 4
-      num_heads: 4
-      num_layers: 1
-      attn_dropout: 0.0
+  # Interleaved cross-attention. After each (1-indexed) conformer layer
+  # listed here, a CrossAttnBlock re-attends the residual stream against the
+  # downsampler's cached 25 Hz post-CNN feature map. All four taps land in
+  # the first half of the stack, where the conformer is still building
+  # acoustic / phonetic representations and Q is still close enough to the
+  # raw post-CNN K/V space for attention patterns to be meaningful. Skip
+  # layer 1 so the conformer establishes a baseline residual first;
+  # second-half layers (9–16) handle subword / word / contextual work and
+  # don't get a tap. K/V cache is freed after layer 8.
+  cross_attn_layer_indices: [2, 4, 6, 8]
+  cross_attn_num_heads: 4
+  cross_attn_dropout: 0.0
   decoder_d_model: 256
   decoder_layers: 4
   decoder_attention_heads: 4

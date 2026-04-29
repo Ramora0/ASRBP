@@ -513,6 +513,11 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._eval_bp_n_boundaries = 0
         self._eval_bp_n_post_frontend = 0
         self._eval_bp_n_input = 0
+        # XA (cross-attn downsampler) per-layer residual-magnitude accumulators.
+        # Lazy-initialized on first stats hit since layer count is config-dependent.
+        self._xa_delta_rms_sum: list[float] = []
+        self._xa_q_rms_sum: list[float] = []
+        self._xa_step_count = 0
 
     def compute_loss(
         self,
@@ -562,21 +567,34 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
             self._ctc_viable_count += int(ctc_viable.sum().item())
             self._ctc_viable_total += int(ctc_viable.numel())
 
-        # Boundary-predictor stats. Any downsampler that exposes
-        # ``last_stats()`` gets its aux loss + realized rate / compression
-        # rolled into the logging window. Static downsamplers (no
-        # ``last_stats``) skip this block silently.
-        downsampler = getattr(unwrapped.encoder, "downsampler", None)
-        last_stats_fn = getattr(downsampler, "last_stats", None) if downsampler is not None else None
-        if last_stats_fn is not None:
-            stats = last_stats_fn()
-            if stats is not None:
-                if stats["aux_loss"] is not None:
+        # Auxiliary stats. The downsampler exposes ``last_stats()`` for BP-
+        # style boundary metrics; the encoder exposes it for the per-tap
+        # cross-attn delta RMS used to track interleaved-XA learning. Each
+        # owns its own key namespace, so we just merge whatever's there and
+        # branch on key presence below.
+        encoder = getattr(unwrapped, "encoder", None)
+        for obj in (getattr(encoder, "downsampler", None), encoder):
+            stats_fn = getattr(obj, "last_stats", None) if obj is not None else None
+            stats = stats_fn() if stats_fn is not None else None
+            if stats is None:
+                continue
+            if "n_boundaries" in stats:
+                if stats.get("aux_loss") is not None:
                     self._bp_aux_loss_sum += stats["aux_loss"]
                 self._bp_n_boundaries += stats["n_boundaries"]
                 self._bp_n_post_frontend += stats["n_post_frontend"]
                 self._bp_n_input += stats["n_input"]
                 self._bp_step_count += 1
+            if "xa_delta_rms" in stats:
+                deltas = stats["xa_delta_rms"]
+                q_rms = stats["xa_q_rms"]
+                if not self._xa_delta_rms_sum:
+                    self._xa_delta_rms_sum = [0.0] * len(deltas)
+                    self._xa_q_rms_sum = [0.0] * len(deltas)
+                for i, (d, q) in enumerate(zip(deltas, q_rms)):
+                    self._xa_delta_rms_sum[i] += float(d)
+                    self._xa_q_rms_sum[i] += float(q)
+                self._xa_step_count += 1
 
         return (loss, outputs) if return_outputs else loss
 
@@ -650,6 +668,21 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                 self._bp_n_post_frontend = 0
                 self._bp_n_input = 0
                 self._bp_step_count = 0
+            if self._xa_step_count > 0:
+                denom_xa = float(self._xa_step_count)
+                for i, (d_sum, q_sum) in enumerate(
+                    zip(self._xa_delta_rms_sum, self._xa_q_rms_sum)
+                ):
+                    q_mean = q_sum / denom_xa
+                    if q_mean > 0:
+                        # Ratio of XA's residual contribution to the residual-stream
+                        # magnitude entering the layer — direct readout of "how
+                        # much is XA actually moving the representation". Starts
+                        # at 0 (zero-init out_proj) and rises as XA learns.
+                        logs[f"train/xa_delta_ratio_l{i}"] = (d_sum / denom_xa) / q_mean
+                self._xa_delta_rms_sum = [0.0] * len(self._xa_delta_rms_sum)
+                self._xa_q_rms_sum = [0.0] * len(self._xa_q_rms_sum)
+                self._xa_step_count = 0
         # Eval log boundary — emit empirical compression rate over the eval set.
         # The downsampler's eval-mode forward zeros out the binomial loss, so
         # there's no ``eval/bp_aux_loss`` companion key — only the realized rate

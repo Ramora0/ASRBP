@@ -515,8 +515,17 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._eval_bp_n_input = 0
         # XA (cross-attn downsampler) per-layer residual-magnitude accumulators.
         # Lazy-initialized on first stats hit since layer count is config-dependent.
+        # Reference accumulators track the conformer layer's own residual delta at
+        # the same depth — emitted as ``train/xa_relative_strength_l{i}`` so the
+        # per-tap signal is self-calibrated against an in-stack baseline.
         self._xa_delta_rms_sum: list[float] = []
         self._xa_q_rms_sum: list[float] = []
+        self._xa_ref_delta_rms_sum: list[float] = []
+        self._xa_ref_q_rms_sum: list[float] = []
+        # Per-tap reference counter — independent of ``_xa_step_count`` because
+        # the conformer layer right before a tap can be layer-dropped
+        # (10% / layer / step), in which case its delta isn't recorded.
+        self._xa_ref_step_count: list[int] = []
         self._xa_step_count = 0
 
     def compute_loss(
@@ -588,12 +597,21 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
             if "xa_delta_rms" in stats:
                 deltas = stats["xa_delta_rms"]
                 q_rms = stats["xa_q_rms"]
+                ref_d = stats.get("xa_ref_layer_delta_rms") or [None] * len(deltas)
+                ref_q = stats.get("xa_ref_layer_q_rms") or [None] * len(deltas)
                 if not self._xa_delta_rms_sum:
                     self._xa_delta_rms_sum = [0.0] * len(deltas)
                     self._xa_q_rms_sum = [0.0] * len(deltas)
-                for i, (d, q) in enumerate(zip(deltas, q_rms)):
+                    self._xa_ref_delta_rms_sum = [0.0] * len(deltas)
+                    self._xa_ref_q_rms_sum = [0.0] * len(deltas)
+                    self._xa_ref_step_count = [0] * len(deltas)
+                for i, (d, q, rd, rq) in enumerate(zip(deltas, q_rms, ref_d, ref_q)):
                     self._xa_delta_rms_sum[i] += float(d)
                     self._xa_q_rms_sum[i] += float(q)
+                    if rd is not None and rq is not None:
+                        self._xa_ref_delta_rms_sum[i] += float(rd)
+                        self._xa_ref_q_rms_sum[i] += float(rq)
+                        self._xa_ref_step_count[i] += 1
                 self._xa_step_count += 1
 
         return (loss, outputs) if return_outputs else loss
@@ -670,18 +688,31 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                 self._bp_step_count = 0
             if self._xa_step_count > 0:
                 denom_xa = float(self._xa_step_count)
-                for i, (d_sum, q_sum) in enumerate(
-                    zip(self._xa_delta_rms_sum, self._xa_q_rms_sum)
-                ):
-                    q_mean = q_sum / denom_xa
+                for i in range(len(self._xa_delta_rms_sum)):
+                    d_mean = self._xa_delta_rms_sum[i] / denom_xa
+                    q_mean = self._xa_q_rms_sum[i] / denom_xa
                     if q_mean > 0:
-                        # Ratio of XA's residual contribution to the residual-stream
-                        # magnitude entering the layer — direct readout of "how
-                        # much is XA actually moving the representation". Starts
-                        # at 0 (zero-init out_proj) and rises as XA learns.
-                        logs[f"train/xa_delta_ratio_l{i}"] = (d_sum / denom_xa) / q_mean
+                        # Absolute ratio: XA's contribution to the residual
+                        # stream entering the block.
+                        logs[f"train/xa_delta_ratio_l{i}"] = d_mean / q_mean
+                    # Reference: the conformer layer's own residual delta at
+                    # the same depth, and XA's contribution as a fraction of
+                    # it. Self-calibrating — > 0.25 means XA is doing real
+                    # work relative to a full conformer layer; < 0.05 means
+                    # XA is small change vs the layer's own contribution.
+                    n_ref = self._xa_ref_step_count[i]
+                    if n_ref > 0:
+                        rd_mean = self._xa_ref_delta_rms_sum[i] / float(n_ref)
+                        rq_mean = self._xa_ref_q_rms_sum[i] / float(n_ref)
+                        if rq_mean > 0:
+                            logs[f"train/xa_layer_delta_ratio_l{i}"] = rd_mean / rq_mean
+                        if rd_mean > 0:
+                            logs[f"train/xa_relative_strength_l{i}"] = d_mean / rd_mean
                 self._xa_delta_rms_sum = [0.0] * len(self._xa_delta_rms_sum)
                 self._xa_q_rms_sum = [0.0] * len(self._xa_q_rms_sum)
+                self._xa_ref_delta_rms_sum = [0.0] * len(self._xa_ref_delta_rms_sum)
+                self._xa_ref_q_rms_sum = [0.0] * len(self._xa_ref_q_rms_sum)
+                self._xa_ref_step_count = [0] * len(self._xa_ref_step_count)
                 self._xa_step_count = 0
         # Eval log boundary — emit empirical compression rate over the eval set.
         # The downsampler's eval-mode forward zeros out the binomial loss, so

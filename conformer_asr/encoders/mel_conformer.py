@@ -282,12 +282,23 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         # 1-indexed → 0-indexed lookup of "which XA block fires after layer i".
         xa_after = {idx - 1: i for i, idx in enumerate(self.cross_attn_layer_indices)}
 
+        # Reference deltas: how much the conformer layer immediately preceding
+        # each XA tap shifts the residual stream. Logged alongside XA's own
+        # delta so the per-tap ratio is self-calibrated against the layer's
+        # own contribution rather than a hand-picked baseline. ``None``
+        # entries mean the reference layer was layer-dropped this step —
+        # capturing 0 instead would skew the accumulator's mean toward 0.
+        n_taps = len(self.cross_attn_layer_indices)
+        ref_layer_delta_rms: list[float | None] = [None] * n_taps
+        ref_layer_q_rms: list[float | None] = [None] * n_taps
+
         for i, layer in enumerate(encoder.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             dropout_probability = torch.rand([])
             skip_the_layer = self.training and dropout_probability < encoder.config.layerdrop
+            h_before_layer = hidden_states if i in xa_after else None
             if not skip_the_layer:
                 layer_outputs = layer(
                     hidden_states,
@@ -303,8 +314,23 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
 
             if i in xa_after:
-                block = self.cross_attn_blocks[xa_after[i]]
+                tap = xa_after[i]
+                # Reference: the conformer layer's residual contribution at
+                # this depth. Skip when layer-dropped — the "delta" would be
+                # zero (layer didn't run), which would bias the running
+                # mean toward 0 and produce garbage relative-strength ratios.
+                if not skip_the_layer:
+                    with torch.no_grad():
+                        ref_delta = (hidden_states - h_before_layer).detach().float()
+                        ref_layer_delta_rms[tap] = float(ref_delta.pow(2).mean().sqrt().item())
+                        ref_layer_q_rms[tap] = float(
+                            h_before_layer.detach().float().pow(2).mean().sqrt().item()
+                        )
+                block = self.cross_attn_blocks[tap]
                 hidden_states = block(hidden_states, kv, q_positions, k_positions, kv_mask)
+
+        self._last_ref_layer_delta_rms = ref_layer_delta_rms
+        self._last_ref_layer_q_rms = ref_layer_q_rms
 
         hidden_states = encoder.layer_norm(hidden_states)
         if output_hidden_states:
@@ -328,6 +354,12 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         Trainer's stat accumulator branches on key presence, so the
         ``xa_*`` namespace stays disjoint from BP's
         ``n_boundaries`` / ``aux_loss`` keys.
+
+        Includes a ``ref_*`` reference: the residual delta contributed by
+        the conformer layer immediately preceding each tap. Logging XA
+        and the layer side by side makes the per-tap ratio self-
+        calibrating — XA's contribution as a fraction of the layer's own
+        contribution at the same depth.
         """
         if not self.cross_attn_blocks:
             return None
@@ -335,4 +367,9 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         q_rms = [getattr(b, "_last_q_rms", None) for b in self.cross_attn_blocks]
         if any(v is None for v in deltas):
             return None
-        return {"xa_delta_rms": deltas, "xa_q_rms": q_rms}
+        return {
+            "xa_delta_rms": deltas,
+            "xa_q_rms": q_rms,
+            "xa_ref_layer_delta_rms": list(getattr(self, "_last_ref_layer_delta_rms", [])),
+            "xa_ref_layer_q_rms": list(getattr(self, "_last_ref_layer_q_rms", [])),
+        }

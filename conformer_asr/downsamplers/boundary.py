@@ -141,6 +141,11 @@ class BoundaryPredictorDownsampler(Downsampler):
         flat_dim = self.frontend.proj.in_features
         bp_hidden = int(bp_hidden) if bp_hidden is not None else max(self.hidden // 4, 16)
         self.bp_hidden = bp_hidden
+        # LayerNorm the raw conv features before the BP MLP scores them.
+        # The conv stack has no built-in normalization and its activation
+        # scale drifts during training, which would otherwise feed the
+        # scorer a non-stationary input distribution.
+        self.pre_mlp_norm = nn.LayerNorm(flat_dim)
         self.boundary_mlp = nn.Sequential(
             nn.Linear(flat_dim, bp_hidden),
             nn.GELU(),
@@ -148,6 +153,13 @@ class BoundaryPredictorDownsampler(Downsampler):
         )
         self._init_prior_bias()
         self.mlp_dropout = nn.Dropout(p=mlp_dropout)
+        # LayerNorm the pooled output before it enters the encoder. Without
+        # this, the residual-stream scale at the encoder input is a direct
+        # function of the compression rate (mean-pool variance ~ 1/N), which
+        # creates a feedback loop: longer segments → smoother tokens → from-
+        # scratch encoder prefers them → STE gradient rewards fewer
+        # boundaries → compression collapses to ~1.
+        self.post_pool_norm = nn.LayerNorm(self.hidden)
 
         self._cached_lengths: torch.LongTensor | None = None
         self._cached_aux_loss: torch.Tensor | None = None
@@ -270,7 +282,7 @@ class BoundaryPredictorDownsampler(Downsampler):
     ) -> torch.Tensor:
         # Run the boundary head in fp32 so RelaxedBernoulli is stable under
         # bf16/fp16 autocast (the distribution rejects half-precision probs).
-        logits = self.boundary_mlp(self.mlp_dropout(h)).squeeze(-1).float()
+        logits = self.boundary_mlp(self.mlp_dropout(self.pre_mlp_norm(h))).squeeze(-1).float()
         probs = torch.sigmoid(logits)
 
         if self.training:
@@ -369,9 +381,11 @@ class BoundaryPredictorDownsampler(Downsampler):
             boundaries = self._learned_boundaries(h_flat, valid_mask, actual_lens, T_cnn)
 
         # 4. Mean-pool the pre-projection features by segment id, then
-        # apply the deferred proj + dropout to land in (B, S, hidden).
+        # apply the deferred proj + LayerNorm + dropout to land in (B, S, hidden).
         pooled_flat = self._mean_pool(boundaries, h_flat)
-        pooled = self.frontend.dropout(self.frontend.proj(pooled_flat))
+        pooled = self.frontend.proj(pooled_flat)
+        pooled = self.post_pool_norm(pooled.float()).to(pooled.dtype)
+        pooled = self.frontend.dropout(pooled)
 
         # 5. Cache per-sample output lengths, post-frontend lengths, and
         # (training-only) aux loss. The post-frontend / input-length caches

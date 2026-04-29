@@ -34,7 +34,7 @@ model:
       prior: 0.25
       temp: 0.2
       mlp_dropout: 0.1
-      loss_weight: 100.0
+      loss_weight: 10.0
       boundary_mode: learned
   decoder_d_model: 256
   decoder_layers: 4

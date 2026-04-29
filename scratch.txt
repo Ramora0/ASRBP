@@ -5,6 +5,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=2 scripts/train.py --config configs/xa/xa_16x_no_ca.yaml
 ct
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=2 scripts/train.py --config configs/bp/bp_8x.yaml
+
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m torch.distributed.run --standalone --nproc_per_node=2 scripts/train.py --config configs/bp/bp_8x.yaml
 

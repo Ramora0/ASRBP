@@ -118,6 +118,7 @@ class BoundaryPredictorDownsampler(Downsampler):
         boundary_mode: str = "learned",
         bp_hidden: int | None = None,
         init_prior_bias: bool = True,
+        bp_isolated: bool = False,
     ):
         super().__init__()
         if boundary_mode not in {"learned", "all", "alternating"}:
@@ -133,6 +134,15 @@ class BoundaryPredictorDownsampler(Downsampler):
         self.temp = float(temp)
         self.loss_weight = float(loss_weight)
         self.boundary_mode = boundary_mode
+        # Diagnostic switch: when True, the BP MLP is trained ONLY by the
+        # binomial aux loss. The main-task gradient is cut at two places:
+        # (1) ``boundaries.detach()`` before the mean-pool so the encoder's
+        # gradient can't reach soft → logit → MLP; (2) ``h.detach()`` at the
+        # MLP input so the aux gradient can't smear back into the conv stack.
+        # Forward path is unchanged. Used to disambiguate "indirect path
+        # overpowers binomial" from "binomial gradient is structurally bad
+        # under STE+RelaxedBernoulli".
+        self.bp_isolated = bool(bp_isolated)
 
         # BP scores boundaries on the conv stack's pre-projection features
         # (``hidden * mel_after`` per frame). Bottleneck the MLP at
@@ -168,11 +178,6 @@ class BoundaryPredictorDownsampler(Downsampler):
         self._cached_aux_loss: torch.Tensor | None = None
         self._cached_post_frontend_lens: torch.LongTensor | None = None
         self._cached_input_lengths: torch.LongTensor | None = None
-        # Detached per-frame diagnostics from the most-recent learned-mode
-        # forward. Surfaced through last_stats() for the trainer to log.
-        self._diag_logits: torch.Tensor | None = None
-        self._diag_probs: torch.Tensor | None = None
-        self._diag_valid_mask: torch.Tensor | None = None
 
     def _init_prior_bias(self) -> None:
         # Start the boundary predictor at exactly `prior` regardless of the
@@ -214,26 +219,11 @@ class BoundaryPredictorDownsampler(Downsampler):
             across the batch (denominator for ``realized_prior``).
           - ``n_input``: total valid mel-frame inputs across the batch
             (denominator for end-to-end compression).
-          - ``bp_bias``: current value of ``boundary_mlp[-1].bias`` — the
-            "global rate knob"; drifts under count-loss feedback.
-          - ``bp_logit_mean`` / ``bp_logit_std``: distribution of the
-            per-frame logits over valid positions. ``std`` near zero ⇒ the
-            bias is doing all the work, the per-frame MLP isn't
-            discriminating; ``std`` growing ⇒ the MLP is finding
-            structure.
-          - ``bp_prob_mean``: average per-frame probability. Should track
-            the prior at equilibrium.
-          - ``bp_frac_sat_low`` / ``bp_frac_sat_high``: fraction of valid
-            frames with ``probs < 0.05`` / ``probs > 0.95``. Saturated
-            frames have ~zero gradient flow through ``soft*(1-soft)``;
-            monotonic growth here is the saturation-collapse signature.
-          Returns ``None`` for the diagnostic keys (still emitting the
-          first four) when the BP wasn't run in learned mode this step.
         """
         if self._cached_lengths is None:
             return None
         aux = self._cached_aux_loss
-        out = {
+        return {
             "aux_loss": float(aux.detach().float().item()) if aux is not None else None,
             "n_boundaries": int(self._cached_lengths.sum().item()),
             "n_post_frontend": (
@@ -247,25 +237,6 @@ class BoundaryPredictorDownsampler(Downsampler):
                 else 0
             ),
         }
-        # Per-frame distribution diagnostics (learned-mode only). ``all`` /
-        # ``alternating`` modes don't run the MLP, so these are None there.
-        if (
-            self._diag_logits is not None
-            and self._diag_probs is not None
-            and self._diag_valid_mask is not None
-        ):
-            valid = self._diag_valid_mask.bool()
-            if valid.any():
-                vlogits = self._diag_logits[valid].float()
-                vprobs = self._diag_probs[valid].float()
-                bias_val = float(self.boundary_mlp[-1].bias.detach().float().item())
-                out["bp_bias"] = bias_val
-                out["bp_logit_mean"] = float(vlogits.mean().item())
-                out["bp_logit_std"] = float(vlogits.std().item()) if vlogits.numel() > 1 else 0.0
-                out["bp_prob_mean"] = float(vprobs.mean().item())
-                out["bp_frac_sat_low"] = float((vprobs < 0.05).float().mean().item())
-                out["bp_frac_sat_high"] = float((vprobs > 0.95).float().mean().item())
-        return out
 
     def output_lengths(self, input_lengths: torch.LongTensor) -> torch.LongTensor:
         """Dynamic — returns the per-sample boundary counts cached by the
@@ -327,15 +298,9 @@ class BoundaryPredictorDownsampler(Downsampler):
     ) -> torch.Tensor:
         # Run the boundary head in fp32 so RelaxedBernoulli is stable under
         # bf16/fp16 autocast (the distribution rejects half-precision probs).
-        logits = self.boundary_mlp(self.mlp_dropout(self.pre_mlp_norm(h))).squeeze(-1).float()
+        h_in = h.detach() if self.bp_isolated else h
+        logits = self.boundary_mlp(self.mlp_dropout(self.pre_mlp_norm(h_in))).squeeze(-1).float()
         probs = torch.sigmoid(logits)
-
-        # Stash detached snapshots for last_stats() — used by the trainer
-        # to surface logit/prob distribution diagnostics. Cheap (just one
-        # detach per call); only the latest forward is kept.
-        self._diag_logits = logits.detach()
-        self._diag_probs = probs.detach()
-        self._diag_valid_mask = valid_mask.detach()
 
         if self.training:
             dist = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(
@@ -438,7 +403,11 @@ class BoundaryPredictorDownsampler(Downsampler):
 
         # 4. Mean-pool the pre-projection features by segment id, then
         # apply the deferred proj + LayerNorm + dropout to land in (B, S, hidden).
-        pooled_flat = self._mean_pool(boundaries, h_flat)
+        # When ``bp_isolated`` is on, route a detached copy into the pool so
+        # the main-loss gradient stops at the segment assignments — only the
+        # un-detached ``boundaries`` reaches the binomial below.
+        boundaries_for_pool = boundaries.detach() if self.bp_isolated else boundaries
+        pooled_flat = self._mean_pool(boundaries_for_pool, h_flat)
         pooled = self.frontend.proj(pooled_flat)
         pooled = self.post_pool_norm(pooled.float()).to(pooled.dtype)
         pooled = self.frontend.dropout(pooled)

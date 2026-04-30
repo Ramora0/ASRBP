@@ -485,8 +485,15 @@ class BPXADownsampler(Downsampler):
             input_lengths.detach().long() if input_lengths is not None else None
         )
         if self.training and self.boundary_mode == "learned":
+            # Use the STE-wrapped ``gate`` (hard - soft.detach() + soft), not
+            # ``hard`` directly. Forward value is identical to hard.sum(); the
+            # difference is that gate.sum() routes the binomial NLL gradient
+            # back through ``soft`` to the BP scorer's logits. Passing ``hard``
+            # here silently makes the aux loss a no-op for the BP MLP — its
+            # ``.sum()`` has no grad_fn, so ``aux.backward()`` errors out / is
+            # skipped, leaving the binomial unable to train the scorer.
             self._cached_aux_loss = self.loss_weight * self._binomial_loss(
-                hard, actual_lens
+                gate, actual_lens
             )
         else:
             self._cached_aux_loss = None

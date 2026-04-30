@@ -481,13 +481,8 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
     diagnostics across the logging window and emits them under a ``bp/``
     section (so they group into their own panel in wandb). Train-time keys:
     ``bp/aux_loss``, ``bp/realized_prior``, ``bp/compression`` (post-
-    frontend), ``bp/total_compression`` (mel → post-BP), plus the per-frame
-    distribution diagnostics (``bp/bias``, ``bp/logit_mean``, ``bp/logit_std``,
-    ``bp/prob_mean``, ``bp/frac_sat_low``, ``bp/frac_sat_high``) and gradient
-    norms captured after backward (``bp/bias_grad``, ``bp/mlp_last_w_grad``,
-    ``bp/mlp_first_w_grad``, ``bp/pre_norm_grad``, ``bp/post_norm_grad``).
-    Static downsamplers have no ``last_stats()`` so these keys simply don't
-    appear.
+    frontend), ``bp/total_compression`` (mel → post-BP). Static downsamplers
+    have no ``last_stats()`` so these keys simply don't appear.
 
     The same accumulators run during evaluation (driven by ``prediction_step``
     rather than ``compute_loss``); empirical compression at eval time is
@@ -513,24 +508,6 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._bp_n_post_frontend = 0
         self._bp_n_input = 0
         self._bp_step_count = 0
-        # Per-frame distribution diagnostics (learned-mode only). Surfaced
-        # as ``bp/bias``, ``bp/logit_mean``, etc. on log boundary.
-        self._bp_diag_step_count = 0
-        self._bp_bias_sum = 0.0
-        self._bp_logit_mean_sum = 0.0
-        self._bp_logit_std_sum = 0.0
-        self._bp_prob_mean_sum = 0.0
-        self._bp_frac_sat_low_sum = 0.0
-        self._bp_frac_sat_high_sum = 0.0
-        # Gradient-norm diagnostics: captured AFTER super().training_step has
-        # run backward, so all .grad fields are populated. Lets us see whether
-        # the binomial loss is actually reaching the BP parameters.
-        self._bp_grad_step_count = 0
-        self._bp_bias_grad_sum = 0.0
-        self._bp_mlp_first_grad_sum = 0.0
-        self._bp_mlp_last_w_grad_sum = 0.0
-        self._bp_pre_norm_grad_sum = 0.0
-        self._bp_post_norm_grad_sum = 0.0
         # Eval-time BP accumulators. Reset on every ``evaluate()`` call so the
         # numbers come out per-eval rather than rolling across the whole run.
         self._eval_bp_n_boundaries = 0
@@ -581,6 +558,20 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         else:
             loss = aed_loss
 
+        # Re-fold the downsampler's auxiliary loss back into the total. The
+        # model's forward already added it to ``outputs.loss``, but we just
+        # rebuilt ``loss`` from ``aed_loss`` + ``ctc_loss`` (so the label
+        # smoother can run on AED logits), which dropped the aux term. Without
+        # this re-add, the BP's binomial gradient never enters backward and
+        # the BP MLP receives ``.grad = None`` — silently making the aux loss
+        # a no-op for any downsampler that exposes ``aux_loss()``.
+        encoder_for_aux = getattr(unwrapped, "encoder", None)
+        ds_for_aux = getattr(encoder_for_aux, "downsampler", None) if encoder_for_aux is not None else None
+        aux_fn = getattr(ds_for_aux, "aux_loss", None) if ds_for_aux is not None else None
+        aux_loss = aux_fn() if aux_fn is not None else None
+        if aux_loss is not None and loss is not None:
+            loss = loss + aux_loss.to(loss.dtype)
+
         # Accumulate component sums for the next ``log()`` emission. Detaching
         # first so we don't retain autograd graphs across steps.
         if aed_loss is not None:
@@ -616,15 +607,6 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                 self._bp_n_post_frontend += stats["n_post_frontend"]
                 self._bp_n_input += stats["n_input"]
                 self._bp_step_count += 1
-                # Per-frame distribution diagnostics (learned-mode only).
-                if "bp_bias" in stats:
-                    self._bp_bias_sum += stats["bp_bias"]
-                    self._bp_logit_mean_sum += stats["bp_logit_mean"]
-                    self._bp_logit_std_sum += stats["bp_logit_std"]
-                    self._bp_prob_mean_sum += stats["bp_prob_mean"]
-                    self._bp_frac_sat_low_sum += stats["bp_frac_sat_low"]
-                    self._bp_frac_sat_high_sum += stats["bp_frac_sat_high"]
-                    self._bp_diag_step_count += 1
             if "xa_delta_rms" in stats:
                 deltas = stats["xa_delta_rms"]
                 q_rms = stats["xa_q_rms"]
@@ -643,50 +625,6 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                 self._xa_step_count += 1
 
         return (loss, outputs) if return_outputs else loss
-
-    def training_step(self, model, inputs, num_items_in_batch=None):
-        # Run forward+backward via the parent. Gradients are populated on
-        # all params after this call, but optimizer.step()/zero_grad() are
-        # still in the future (the outer trainer loop owns those). That's
-        # the right window to peek at the BP's grad fields.
-        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
-        self._capture_bp_grad_norms(model)
-        return loss
-
-    def _capture_bp_grad_norms(self, model) -> None:
-        """Read .grad off select BP parameters and add their norms to the
-        rolling sum. No-op for non-BP downsamplers and for the steps where
-        gradient accumulation hasn't yet attached a grad.
-        """
-        unwrapped = model
-        while hasattr(unwrapped, "module"):
-            unwrapped = unwrapped.module
-        downsampler = getattr(getattr(unwrapped, "encoder", None), "downsampler", None)
-        if downsampler is None or not hasattr(downsampler, "boundary_mlp"):
-            return
-        bias = downsampler.boundary_mlp[-1].bias
-        last_w = downsampler.boundary_mlp[-1].weight
-        first_w = downsampler.boundary_mlp[0].weight
-        pre_w = getattr(downsampler, "pre_mlp_norm", None)
-        post_w = getattr(downsampler, "post_pool_norm", None)
-        # Some grads can be None if the param was layer-dropped or sees no
-        # gradient flow this step; skip in that case rather than crashing.
-        captured_any = False
-        if bias.grad is not None:
-            self._bp_bias_grad_sum += float(bias.grad.detach().norm().item())
-            captured_any = True
-        if last_w.grad is not None:
-            self._bp_mlp_last_w_grad_sum += float(last_w.grad.detach().norm().item())
-            captured_any = True
-        if first_w.grad is not None:
-            self._bp_mlp_first_grad_sum += float(first_w.grad.detach().norm().item())
-            captured_any = True
-        if pre_w is not None and pre_w.weight.grad is not None:
-            self._bp_pre_norm_grad_sum += float(pre_w.weight.grad.detach().norm().item())
-        if post_w is not None and post_w.weight.grad is not None:
-            self._bp_post_norm_grad_sum += float(post_w.weight.grad.detach().norm().item())
-        if captured_any:
-            self._bp_grad_step_count += 1
 
     def _accumulate_eval_bp_stats(self, model) -> None:
         """Read ``last_stats()`` off the model's downsampler and add to the
@@ -758,34 +696,6 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
                 self._bp_n_post_frontend = 0
                 self._bp_n_input = 0
                 self._bp_step_count = 0
-            if self._bp_diag_step_count > 0:
-                d = float(self._bp_diag_step_count)
-                logs["bp/bias"] = self._bp_bias_sum / d
-                logs["bp/logit_mean"] = self._bp_logit_mean_sum / d
-                logs["bp/logit_std"] = self._bp_logit_std_sum / d
-                logs["bp/prob_mean"] = self._bp_prob_mean_sum / d
-                logs["bp/frac_sat_low"] = self._bp_frac_sat_low_sum / d
-                logs["bp/frac_sat_high"] = self._bp_frac_sat_high_sum / d
-                self._bp_diag_step_count = 0
-                self._bp_bias_sum = 0.0
-                self._bp_logit_mean_sum = 0.0
-                self._bp_logit_std_sum = 0.0
-                self._bp_prob_mean_sum = 0.0
-                self._bp_frac_sat_low_sum = 0.0
-                self._bp_frac_sat_high_sum = 0.0
-            if self._bp_grad_step_count > 0:
-                gd = float(self._bp_grad_step_count)
-                logs["bp/bias_grad"] = self._bp_bias_grad_sum / gd
-                logs["bp/mlp_last_w_grad"] = self._bp_mlp_last_w_grad_sum / gd
-                logs["bp/mlp_first_w_grad"] = self._bp_mlp_first_grad_sum / gd
-                logs["bp/pre_norm_grad"] = self._bp_pre_norm_grad_sum / gd
-                logs["bp/post_norm_grad"] = self._bp_post_norm_grad_sum / gd
-                self._bp_grad_step_count = 0
-                self._bp_bias_grad_sum = 0.0
-                self._bp_mlp_last_w_grad_sum = 0.0
-                self._bp_mlp_first_grad_sum = 0.0
-                self._bp_pre_norm_grad_sum = 0.0
-                self._bp_post_norm_grad_sum = 0.0
             if self._xa_step_count > 0:
                 denom_xa = float(self._xa_step_count)
                 for i in range(len(self._xa_delta_rms_sum)):

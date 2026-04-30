@@ -45,6 +45,12 @@ model:
       loss_weight: 10.0
       boundary_mode: learned
       init_prior_bias: false
+      # Diagnostic: cut the main-task gradient from the BP MLP. The binomial
+      # is then the *only* signal training boundary scoring, so collapse vs.
+      # convergence-to-prior tells us whether the indirect path was the
+      # culprit (collapse stops) or the binomial gradient itself is
+      # structurally broken under STE+RelaxedBernoulli (collapse persists).
+      bp_isolated: true
   decoder_d_model: 256
   decoder_layers: 4
   decoder_attention_heads: 4

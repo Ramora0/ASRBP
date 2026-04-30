@@ -107,6 +107,17 @@ class ModelConfig:
     cross_attn_layer_indices: list[int] = field(default_factory=list)
     cross_attn_num_heads: int = 4
     cross_attn_dropout: float = 0.0
+    # Number of K/V projector groups across the interleaved XA blocks. The
+    # taps are partitioned contiguously by depth so adjacent layers share a
+    # K/V view: group_idx = block_idx * n_groups // n_taps. ``1`` (default)
+    # = every tap shares one global ``SharedKVProjector`` — the original
+    # design, which gives all blocks the identical K/V view and frees them
+    # only on the query side. Larger values trade compute for capacity:
+    # different groups can learn different K/V "views" of the post-CNN
+    # features. ``cross_attn_kv_groups == len(cross_attn_layer_indices)`` =
+    # standard per-layer cross-attention (each block has its own K/V
+    # projector). Capped at ``len(cross_attn_layer_indices)``.
+    cross_attn_kv_groups: int = 1
 
 
 @dataclass
@@ -176,16 +187,6 @@ class TrainConfig:
     seed: int
     generation_max_length: int
     generation_num_beams: int
-    # Stochastic Weight Averaging. When enabled, maintains a running mean of
-    # weights from ``swa_start_frac * num_train_epochs`` onward (per-epoch sampling),
-    # and at end of training writes the averaged weights to
-    # ``<output_dir>/final-swa/pytorch_model.bin``. Evaluate separately via
-    # ``scripts/evaluate.py --checkpoint <output_dir>/final-swa``. Adds one
-    # extra full-model copy on GPU (~200 MB for Conformer-S — rounding error on
-    # 32 GB V100). Conformer uses LayerNorm, so no post-hoc BN update pass is
-    # needed.
-    swa_enabled: bool
-    swa_start_frac: float
 
 
 @dataclass

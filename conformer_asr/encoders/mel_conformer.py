@@ -60,6 +60,7 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
         cross_attn_layer_indices: Sequence[int] = (),
         cross_attn_num_heads: int = 4,
         cross_attn_dropout: float = 0.0,
+        cross_attn_kv_groups: int = 1,
     ):
         super().__init__(config)
         self.n_mels = int(config.n_mels)
@@ -89,13 +90,33 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
                     f"exposes a post-CNN K/V cache; "
                     f"{type(self.downsampler).__name__} does not."
                 )
-            # K/V are computed once per encoder forward by the shared
-            # projector and broadcast to every interleaved tap. See
-            # ``SharedKVProjector`` for the rationale (~80% per-tap compute
-            # lives in K/V projections at T_k = 4 × T_q).
-            self.shared_kv_projector = SharedKVProjector(
-                hidden=config.hidden_size,
-                num_heads=cross_attn_num_heads,
+            # K/V projector groups. Each group projects the same post-CNN
+            # K/V source through its own ``SharedKVProjector`` parameters,
+            # so the blocks in a group see one shared K/V view but
+            # different groups see different views. ``n_groups == 1``
+            # recovers the original "all taps share one K/V" design;
+            # ``n_groups == len(idx)`` recovers standard per-layer XA.
+            # Each projector still amortizes the K/V projection over the
+            # blocks in its group — at T_k = 4 × T_q, K/V projection is
+            # the dominant per-block cost.
+            if cross_attn_kv_groups < 1:
+                raise ValueError(
+                    f"cross_attn_kv_groups must be >= 1, got {cross_attn_kv_groups}"
+                )
+            n_taps = len(idx)
+            n_groups = min(int(cross_attn_kv_groups), n_taps)
+            self.kv_projectors = nn.ModuleList([
+                SharedKVProjector(
+                    hidden=config.hidden_size,
+                    num_heads=cross_attn_num_heads,
+                )
+                for _ in range(n_groups)
+            ])
+            # Contiguous depth-wise partition: blocks 0..k1-1 → group 0,
+            # k1..k2-1 → group 1, etc. The multiplicative form gives a
+            # well-balanced split even when n_taps doesn't divide evenly.
+            self.block_to_group: tuple[int, ...] = tuple(
+                (i * n_groups) // n_taps for i in range(n_taps)
             )
             self.cross_attn_blocks = nn.ModuleList([
                 CrossAttnBlock(
@@ -107,7 +128,8 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
                 for _ in idx
             ])
         else:
-            self.shared_kv_projector = None
+            self.kv_projectors = nn.ModuleList()
+            self.block_to_group = ()
             self.cross_attn_blocks = nn.ModuleList()
 
         self.post_init()
@@ -274,12 +296,16 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
             q_positions = torch.arange(0, T_q * stride, stride, device=device)[:T_q]
         k_positions = torch.arange(T_k, device=device)
 
-        # Shared K/V: project + RoPE-rotate once for the whole encoder pass,
-        # then reuse across every interleaved tap below. The K/V source and
-        # k_positions are identical across taps, so this is a strict compute
-        # win with no modeling-capacity loss on the K/V side (per-tap views
-        # are still expressible via each block's own query function).
-        K_shared, V_shared = self.shared_kv_projector(kv, k_positions)
+        # K/V groups: project + RoPE-rotate once per group for the whole
+        # encoder pass, then reuse across every tap assigned to that group
+        # below. With ``n_groups == 1`` this recovers the original "single
+        # shared projector" behavior; with ``n_groups == n_taps`` it's
+        # standard per-layer cross-attention. The K/V source and
+        # k_positions are identical across all taps, so the only thing
+        # that differs across groups is the projector parameters.
+        group_kv: list[tuple[torch.Tensor, torch.Tensor]] = [
+            proj(kv, k_positions) for proj in self.kv_projectors
+        ]
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -347,7 +373,8 @@ class MelConformerEncoder(Wav2Vec2ConformerPreTrainedModel):
                         ref_delta = (hidden_states - h_before_layer).detach().float()
                         ref_layer_delta_rms[tap] = float(ref_delta.pow(2).mean().sqrt().item())
                 block = self.cross_attn_blocks[tap]
-                hidden_states = block(hidden_states, K_shared, V_shared, q_positions, kv_mask)
+                K_g, V_g = group_kv[self.block_to_group[tap]]
+                hidden_states = block(hidden_states, K_g, V_g, q_positions, kv_mask)
 
         self._last_ref_layer_delta_rms = ref_layer_delta_rms
 

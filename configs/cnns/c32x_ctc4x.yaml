@@ -94,8 +94,6 @@ train:
   seed: 42
   generation_max_length: 300
   generation_num_beams: 1
-  swa_enabled: true
-  swa_start_frac: 0.75
 
 wandb:
   enabled: true

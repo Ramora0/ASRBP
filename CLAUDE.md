@@ -15,7 +15,7 @@ uv pip install -e .
 python scripts/smoke_test.py
 
 # Preprocess the dataset once (required before multi-GPU training to avoid racing on save_to_disk)
-python scripts/preprocess.py --config configs/conformer_small.yaml
+python scripts/preprocess.py --config configs/cnns/c4x.yaml
 
 # Train (defaults = full 960h, --subset clean100 for fast iteration)
 python scripts/train.py --output_dir outputs/run
@@ -33,7 +33,7 @@ Library code lives in `conformer_asr/` (installable package); user-facing entryp
 
 **Swappable architectures.** The model is built from three independently-pluggable families, each registered in its own sub-package:
 
-- `conformer_asr/downsamplers/` — spectrogram → transformer-input bridges. Default `Conv2dDownsampler` (`type: conv2d`). Must implement `forward(x: (B, T_mel, n_mels)) -> (B, T', hidden)` and `output_lengths(input_lengths) -> output_lengths`; the latter is pure time arithmetic so the encoder can build the post-stem attention mask without a forward pass. For `conv2d`, `num_convs=2` is the standard 4× time stem; extras (`>=3`) are kernel `(3, 1)` stride `(2, 1)` — time-only, mel axis untouched — so `num_convs=3` → 8×, `num_convs=4` → 16×.
+- `conformer_asr/downsamplers/` — spectrogram → transformer-input bridges. Default `Conv2dDownsampler` (`type: conv2d`). Must implement `forward(x: (B, T_mel, n_mels)) -> (B, T', hidden)` and `output_lengths(input_lengths) -> output_lengths`; the latter is pure time arithmetic so the encoder can build the post-stem attention mask without a forward pass. For `conv2d`, the stack is fully specified by `strides`: a list of `[time, mel]` pairs, one per Conv2d layer. Kernel is uniformly `(3, 3)`. Padding per axis is 1 when that axis's stride is 1 (preserves dim, Whisper-style context mixing), 0 otherwise (standard no-pad subsampling, `l_out = (l_in - 3) // s + 1`). `[[2,2],[2,2]]` is the 4× time stem; appending `[2,1]` entries extends time-only downsampling (8× at 3 layers, 16× at 4); `[1, _]` entries (e.g. `[[1,2],[2,2]]`) preserve time while still mixing 3-frame context, like Whisper.
 - `conformer_asr/encoders/` — full speech encoders. Default `conformer` → `MelConformerEncoder` (Wav2Vec2ConformerEncoder + a pluggable downsampler + pre-stem `InputNormalization` and `SpecAugment` from `encoders/preproc.py`). Must expose `.config.hidden_size`, return a `BaseModelOutput` from `forward`, and provide `_get_feature_vector_attention_mask` for the decoder-side mask — `ConformerAEDWithCTC` and `scripts/evaluate.py` both call it by name. `InputNormalization` maintains running per-bin mean/var until `FreezeInputNormCallback` flips its `frozen` flag at epoch `input_normalize_freeze_epochs`; the stats ride along in the state_dict so eval inherits them. `SpecAugment` is deterministic (fixed mask count, uniform-length, zero-fill after normalization = per-bin mean) and applied at 100 Hz pre-stem rate; `SpecAugWarmupCallback` can gate it off for the first `spec_aug_warmup_steps`.
 - `conformer_asr/decoders/` — autoregressive decoders with cross-attention. Default `bart` → `_CompatBartForCausalLM` (works around `SpeechEncoderDecoderModel` + `BartForCausalLM` double-embedding bug).
 
@@ -49,7 +49,7 @@ The SDPA fast-path patch for `Wav2Vec2ConformerSelfAttention` lives in `conforme
 
 ### Config flow
 
-All configuration is a `Config` dataclass tree (`ModelConfig`, `DataConfig`, `TrainConfig`, `WandbConfig`) in `conformer_asr/config.py`. `ModelConfig.downsampler` is a nested `DownsamplerConfig` (`type: str`, `kwargs: dict`). `load_config(path, overrides)` loads YAML then applies flat CLI overrides by looking up which section owns each key — so new CLI flags in scripts work as long as the key name matches a top-level dataclass field. Nested sub-configs (e.g. `model.downsampler`) aren't reachable from the flat CLI surface; edit the YAML for those. Defaults in `configs/conformer_small.yaml` must stay in sync with dataclass defaults.
+All configuration is a `Config` dataclass tree (`ModelConfig`, `DataConfig`, `TrainConfig`, `WandbConfig`) in `conformer_asr/config.py`. `ModelConfig.downsampler` is a nested `DownsamplerConfig` (`type: str`, `kwargs: dict`). `load_config(path, overrides)` loads YAML then applies flat CLI overrides by looking up which section owns each key — so new CLI flags in scripts work as long as the key name matches a top-level dataclass field. Nested sub-configs (e.g. `model.downsampler`) aren't reachable from the flat CLI surface; edit the YAML for those. Defaults in `configs/cnns/c4x.yaml` must stay in sync with dataclass defaults.
 
 ### Tokenizer
 

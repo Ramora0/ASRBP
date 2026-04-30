@@ -15,12 +15,14 @@ class DownsamplerConfig:
     ``type`` selects an entry in ``downsamplers.DOWNSAMPLERS``; ``kwargs`` is
     passed through to that implementation's constructor, so adding a new
     downsampler doesn't require touching this schema. The default ``conv2d``
-    stem takes ``num_convs`` (first two are stride ``(2, 2)``, extras are
-    time-only stride ``(2, 1)``).
+    stem takes ``strides``: a list of ``[time, mel]`` pairs, one per Conv2d
+    layer. Kernel is uniformly ``(3, 3)``; padding is 1 on axes with
+    stride 1 (preserves dim, Whisper-style) and 0 elsewhere (standard
+    no-pad subsampling for stride-2 layers).
     """
 
     type: str = "conv2d"
-    kwargs: dict[str, Any] = field(default_factory=lambda: {"num_convs": 2})
+    kwargs: dict[str, Any] = field(default_factory=lambda: {"strides": [[2, 2], [2, 2]]})
 
 
 @dataclass
@@ -86,6 +88,36 @@ class ModelConfig:
     # Spectrogram → transformer-input bridge. Nested so the downsampler family
     # can carry its own knobs without bloating the top-level ``ModelConfig``.
     downsampler: DownsamplerConfig = field(default_factory=DownsamplerConfig)
+    # Where the CTC head taps the encoder stack. ``"encoder"`` (default) reads
+    # the post-Conformer-blocks hidden states — the standard hybrid-CTC
+    # configuration, with CTC gradient flowing through the full encoder.
+    # ``"features"`` reads the post-downsampler tensor instead — CTC trains
+    # only the conv stem and never reaches the Conformer blocks. Same shape
+    # / time dim either way (Conformer doesn't change T), so the CTC head
+    # itself is identical and checkpoints round-trip between modes.
+    ctc_input: str = "encoder"
+    # Interleaved cross-attention. After each conformer layer index listed
+    # here (1-indexed, valid range ``[1, encoder_num_hidden_layers]``), insert
+    # a ``CrossAttnBlock`` that re-attends the residual stream to the
+    # downsampler's cached post-CNN feature map (the higher-rate K/V before
+    # the strided pick). Empty list ⇒ no interleaved cross-attention (plain
+    # conformer running on the downsampler's picked output). Only meaningful
+    # when ``downsampler.type == "cross_attn"`` since other downsamplers
+    # don't expose a post-CNN K/V cache.
+    cross_attn_layer_indices: list[int] = field(default_factory=list)
+    cross_attn_num_heads: int = 4
+    cross_attn_dropout: float = 0.0
+    # Number of K/V projector groups across the interleaved XA blocks. The
+    # taps are partitioned contiguously by depth so adjacent layers share a
+    # K/V view: group_idx = block_idx * n_groups // n_taps. ``1`` (default)
+    # = every tap shares one global ``SharedKVProjector`` — the original
+    # design, which gives all blocks the identical K/V view and frees them
+    # only on the query side. Larger values trade compute for capacity:
+    # different groups can learn different K/V "views" of the post-CNN
+    # features. ``cross_attn_kv_groups == len(cross_attn_layer_indices)`` =
+    # standard per-layer cross-attention (each block has its own K/V
+    # projector). Capped at ``len(cross_attn_layer_indices)``.
+    cross_attn_kv_groups: int = 1
 
 
 @dataclass
@@ -118,6 +150,14 @@ class TrainConfig:
     output_dir: str
     per_device_train_batch_size: int
     per_device_eval_batch_size: int
+    # Target effective batch size = per_device_train_batch_size * world_size *
+    # gradient_accumulation_steps. With ``gradient_accumulation_steps: 0`` in
+    # the YAML (or unset on the CLI), ``resolve_grad_accum`` computes
+    # grad_accum from this and the runtime ``WORLD_SIZE`` so the same config
+    # gives the same effective batch on 1 / 2 / 4 / 8 GPUs without manual
+    # editing. Set ``gradient_accumulation_steps`` to a positive integer to
+    # override and trust whatever effective batch falls out.
+    effective_batch_size: int
     gradient_accumulation_steps: int
     learning_rate: float
     warmup_steps: int
@@ -136,20 +176,17 @@ class TrainConfig:
     gradient_checkpointing: bool
     group_by_length: bool
     dataloader_num_workers: int
+    # Per-worker batch buffer ahead of the GPU. PyTorch default is 2 (so 8
+    # workers × 2 = 16 batches in flight). On networked storage (GPFS / Lustre)
+    # the read latency variance dominates step time, and 16-batch buffer is
+    # not enough — workers stall on coordinated metadata reads and the GPU
+    # drops to 0% util for 1-2 s windows. 4 doubles the buffer; bump higher
+    # if you still see step-time spikes after staging the cache to local NVMe.
+    dataloader_prefetch_factor: int
     report_to: str
     seed: int
     generation_max_length: int
     generation_num_beams: int
-    # Stochastic Weight Averaging. When enabled, maintains a running mean of
-    # weights from ``swa_start_frac * num_train_epochs`` onward (per-epoch sampling),
-    # and at end of training writes the averaged weights to
-    # ``<output_dir>/final-swa/pytorch_model.bin``. Evaluate separately via
-    # ``scripts/evaluate.py --checkpoint <output_dir>/final-swa``. Adds one
-    # extra full-model copy on GPU (~200 MB for Conformer-S — rounding error on
-    # 32 GB V100). Conformer uses LayerNorm, so no post-hoc BN update pass is
-    # needed.
-    swa_enabled: bool
-    swa_start_frac: float
 
 
 @dataclass
@@ -212,6 +249,49 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
                     setattr(section, key, val)
                     break
     return cfg
+
+
+def resolve_grad_accum(train_cfg: TrainConfig, world_size: int) -> None:
+    """Derive ``gradient_accumulation_steps`` from ``effective_batch_size``.
+
+    If ``train_cfg.gradient_accumulation_steps`` is 0, computes
+    ``effective_batch_size // (per_device_train_batch_size * world_size)``
+    and writes it back. If it's a positive integer, leaves it alone (manual
+    override). Raises if the auto-compute doesn't divide evenly or yields a
+    value < 1, since silently rounding either way would change effective
+    batch behind the user's back.
+    """
+    if train_cfg.gradient_accumulation_steps > 0:
+        return
+    if train_cfg.gradient_accumulation_steps < 0:
+        raise ValueError(
+            f"gradient_accumulation_steps must be >= 0, got {train_cfg.gradient_accumulation_steps}"
+        )
+    ws = max(1, world_size)
+    per_step = train_cfg.per_device_train_batch_size * ws
+    if per_step <= 0:
+        raise ValueError(
+            f"per_device_train_batch_size * world_size = {per_step} (must be > 0)"
+        )
+    eff = train_cfg.effective_batch_size
+    if eff <= 0:
+        raise ValueError(f"effective_batch_size must be > 0, got {eff}")
+    if eff % per_step != 0:
+        raise ValueError(
+            f"effective_batch_size={eff} is not divisible by "
+            f"per_device_train_batch_size * world_size = "
+            f"{train_cfg.per_device_train_batch_size} * {ws} = {per_step}. "
+            f"Adjust per_device_train_batch_size or effective_batch_size, "
+            f"or set gradient_accumulation_steps explicitly."
+        )
+    grad_accum = eff // per_step
+    if grad_accum < 1:
+        raise ValueError(
+            f"Derived gradient_accumulation_steps={grad_accum} < 1: "
+            f"per_device_train_batch_size * world_size ({per_step}) "
+            f"already exceeds effective_batch_size ({eff})."
+        )
+    train_cfg.gradient_accumulation_steps = grad_accum
 
 
 def resolve_precision(train_cfg: TrainConfig) -> None:

@@ -1,0 +1,131 @@
+model:
+  # Architecture selectors — see conformer_asr/{encoders,decoders}/__init__.py
+  # for the registered options.
+  encoder_type: conformer
+  decoder_type: bart
+  # Conformer-M sized to match the rest of the project so the 32× run is a
+  # like-for-like comparison vs. xa_16x and the static cnns/c32x stem.
+  encoder_hidden_size: 256
+  encoder_num_hidden_layers: 16
+  encoder_num_attention_heads: 4
+  encoder_intermediate_size: 1024
+  encoder_conv_depthwise_kernel_size: 31
+  encoder_hidden_dropout: 0.05
+  encoder_attention_dropout: 0.05
+  encoder_activation_dropout: 0.05
+  encoder_layerdrop: 0.1
+  n_mels: 80
+  n_fft: 400
+  hop_length: 160
+  # Cross-attention downsampler — feature extractor only. C4x-style Conv2d
+  # frontend (4× time stem) + dilated layers produces a 25 Hz post-CNN
+  # sequence. CTC supervises right there (see ``ctc_input: post_cnn``
+  # below) — CTC trains the conv stem at the higher pre-pick rate where
+  # alignment is easiest. The strided pick (every 8th post-CNN frame) is
+  # the encoder input at ≈3.125 Hz (32× total).
+  #
+  # Cross-attn refinement is interleaved between conformer layers (see
+  # ``cross_attn_layer_indices``) — at this compression each compressed
+  # token is genuinely missing detail, so periodic taps that re-attend the
+  # residual stream to the 25 Hz post-CNN cache are the main lever for
+  # information recovery.
+  #
+  # Dilation schedule [1, 2] is the à trous equivalent of two extra stride-2
+  # layers after the strided frontend: at jump=4, d=1 reads 3 adjacent
+  # layer-2 frames (= a stride-2 layer's view) and d=2 stacked on top
+  # replicates the next stride-2 layer. Gives a dense 31-input-frame RF at
+  # the post-CNN (pre-pick) stage — same RF c16x has, applied here at the
+  # 25 Hz CTC tap. The pick of 8 then adds an additional 8× compression
+  # (no aggregation, just a slice) for the final 32× rate to the conformer.
+  downsampler:
+    type: cross_attn
+    kwargs:
+      strides: [[2, 2], [2, 2]]
+      dilations: [1, 2]
+      stride: 8
+  # Interleaved cross-attention. All four taps in the first half — at 32×
+  # compression each picked frame stands in for 8 post-CNN frames of
+  # detail, so refreshing the residual stream during early acoustic /
+  # phonetic processing is the highest-leverage place to spend the tap.
+  # Same indices as xa_16x for direct comparison; revisit if 32× behaves
+  # differently from 16× under the same schedule.
+  cross_attn_layer_indices: [2, 4, 6, 8]
+  cross_attn_num_heads: 4
+  cross_attn_dropout: 0.0
+  decoder_d_model: 256
+  decoder_layers: 4
+  decoder_attention_heads: 4
+  decoder_ffn_dim: 1024
+  decoder_dropout: 0.05
+  decoder_max_position_embeddings: 448
+  ctc_enabled: true
+  ctc_weight: 0.3
+  # Tap CTC at the post-CNN / pre-pick stage (25 Hz, 4× downsampling) instead
+  # of the encoder output (3.125 Hz). At 32× total compression the encoder
+  # output is too short for CTC to align reliably (``ctc_viable_pct`` would
+  # collapse on long transcripts), so we hand CTC the higher-rate
+  # intermediate where the alignment floor is comfortably met. CTC gradient
+  # flows through the conv stem only — the cross-attn picking and the
+  # Conformer blocks are trained purely by AED.
+  ctc_input: post_cnn
+  input_normalize_freeze_epochs: 4
+  spec_aug_time_masks: 4
+  spec_aug_time_length_low: 15
+  spec_aug_time_length_high: 25
+  spec_aug_feature_masks: 4
+  spec_aug_feature_length_low: 10
+  spec_aug_feature_length_high: 15
+  spec_aug_warmup_steps: 1000
+
+data:
+  dataset_id: openslr/librispeech_asr
+  subset: all960
+  eval_split: validation.clean
+  test_split: test.clean
+  sampling_rate: 16000
+  max_audio_seconds: 20.0
+  speed_perturbations: [0.9, 1.0, 1.1]
+  num_proc: 0
+  tokenizer_dir: null
+  cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache
+
+train:
+  output_dir: outputs/run-xa-32x
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 8
+  effective_batch_size: 256
+  gradient_accumulation_steps: 0
+  learning_rate: 1.0e-3
+  warmup_steps: 2500
+  num_train_epochs: 30.0
+  weight_decay: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  label_smoothing_factor: 0.1
+  lr_scheduler_type: inverse_sqrt
+  logging_steps: 10
+  save_total_limit: 3
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  group_by_length: true
+  dataloader_num_workers: 8
+  dataloader_prefetch_factor: 4
+  report_to: wandb
+  seed: 42
+  generation_max_length: 300
+  generation_num_beams: 1
+
+wandb:
+  enabled: true
+  project: conformer-asr-librispeech
+  entity: null
+  run_name: conformer-xa-32x
+  group: null
+  tags: []
+  notes: ""
+  watch_model: false
+  log_preds_table: true
+  log_preds_n: 16

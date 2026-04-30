@@ -1,0 +1,130 @@
+model:
+  # Architecture selectors — see conformer_asr/{encoders,decoders}/__init__.py
+  # for the registered options.
+  encoder_type: conformer
+  decoder_type: bart
+  # Conformer-M sized to match configs/xa/xa_16x.yaml so the bp_xa run is a
+  # like-for-like comparison vs. uniform strided-pick XA at the same
+  # compression rate. The ONLY difference between this config and xa_16x is
+  # the downsampler block below (BP-predicted picking instead of strided).
+  encoder_hidden_size: 256
+  encoder_num_hidden_layers: 16
+  encoder_num_attention_heads: 4
+  encoder_intermediate_size: 1024
+  encoder_conv_depthwise_kernel_size: 31
+  encoder_hidden_dropout: 0.05
+  encoder_attention_dropout: 0.05
+  encoder_activation_dropout: 0.05
+  encoder_layerdrop: 0.1
+  n_mels: 80
+  n_fft: 400
+  hop_length: 160
+  # BP+XA downsampler. Same conv stack as xa_16x (4× strided + dilated, mel
+  # preserved through every layer, 31-frame post-CNN RF), so the K/V cache
+  # the encoder's interleaved XA blocks read is identical. The only
+  # architectural difference vs xa_16x: queries are gathered at predicted
+  # frame indices (BP-style scorer) instead of at uniform strides.
+  #
+  # prior=0.25 ⇒ ~16× total compression (4× conv stem × 4× selector). The
+  # encoder's interleaved XA blocks see Q at the actual predicted frame
+  # indices (post-CNN coords) for RoPE, so Q-K relative offsets reflect
+  # the true frame-rate gap between picked tokens and key positions.
+  #
+  # See conformer_asr/downsamplers/bp_xa.py for the full pipeline.
+  downsampler:
+    type: bp_xa
+    kwargs:
+      strides: [[2, 2], [2, 2]]
+      dilations: [1, 2]
+      prior: 0.25
+      temp: 0.1
+      mlp_dropout: 0.1
+      loss_weight: 10.0
+      boundary_mode: learned
+      bp_hidden: 64
+  # Interleaved cross-attention — identical schedule to xa_16x.yaml so the
+  # comparison isolates "BP-predicted picking" as the only architectural
+  # difference. Encoder's _encoder_with_xa reads downsampler._kept_indices
+  # for Q's per-sample RoPE positions; falls back to stride-based positions
+  # when the downsampler doesn't provide them (e.g. cross_attn).
+  #
+  # cross_attn_kv_groups=4 ⇒ 16 XA blocks split into 4 contiguous depth
+  # groups of 4, each with its own SharedKVProjector. Reintroduces some of
+  # the K/V capacity that the fully-shared (kv_groups=1) variant lost (it
+  # was unstable past ~5 epochs and worse before that), without going all
+  # the way back to per-layer K/V. Runtime cost: 4 K/V projections per
+  # encoder forward at T_k instead of 1, still much cheaper than the
+  # 16 of standard per-layer XA.
+  cross_attn_layer_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+  cross_attn_num_heads: 4
+  cross_attn_dropout: 0.0
+  cross_attn_kv_groups: 4
+  decoder_d_model: 256
+  decoder_layers: 4
+  decoder_attention_heads: 4
+  decoder_ffn_dim: 1024
+  decoder_dropout: 0.05
+  decoder_max_position_embeddings: 448
+  ctc_enabled: true
+  ctc_weight: 0.3
+  input_normalize_freeze_epochs: 4
+  spec_aug_time_masks: 4
+  spec_aug_time_length_low: 15
+  spec_aug_time_length_high: 25
+  spec_aug_feature_masks: 4
+  spec_aug_feature_length_low: 10
+  spec_aug_feature_length_high: 15
+  spec_aug_warmup_steps: 1000
+
+data:
+  dataset_id: openslr/librispeech_asr
+  subset: all960
+  eval_split: validation.clean
+  test_split: test.clean
+  sampling_rate: 16000
+  max_audio_seconds: 20.0
+  speed_perturbations: [0.9, 1.0, 1.1]
+  num_proc: 0
+  tokenizer_dir: null
+  cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache
+
+train:
+  output_dir: outputs/run-bp-xa-16x
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 8
+  effective_batch_size: 256
+  gradient_accumulation_steps: 0
+  learning_rate: 1.0e-3
+  warmup_steps: 2500
+  num_train_epochs: 30.0
+  weight_decay: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  label_smoothing_factor: 0.1
+  lr_scheduler_type: inverse_sqrt
+  logging_steps: 10
+  save_total_limit: 3
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  group_by_length: true
+  dataloader_num_workers: 8
+  dataloader_prefetch_factor: 4
+  report_to: wandb
+  seed: 42
+  generation_max_length: 300
+  generation_num_beams: 1
+
+wandb:
+  enabled: true
+  project: conformer-asr-librispeech
+  entity: null
+  run_name: conformer-bp-xa-16x
+  group: null
+  tags: []
+  notes: ""
+  watch_model: false
+  log_preds_table: true
+  log_preds_n: 16

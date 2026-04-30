@@ -325,6 +325,8 @@ class CTCEvalCallback(TrainerCallback):
         # (otherwise short-audio batches would be under-weighted vs long ones).
         ctc_loss_sum = 0.0
         ctc_loss_frames = 0
+        ctc_viable_count = 0
+        ctc_viable_total = 0
 
         use_autocast = (
             device.type == "cuda"
@@ -364,13 +366,25 @@ class CTCEvalCallback(TrainerCallback):
                         )
 
                     ctc_logits = outputs.ctc_logits
-                    enc_mask = outputs.encoder_attention_mask
-                    input_lengths = enc_mask.sum(-1).long() if enc_mask is not None else None
+                    # Prefer ``ctc_attention_mask`` so the CTC time dim
+                    # matches the logits even when ``ctc_input='post_cnn'``
+                    # (where the encoder mask is at a *different* rate). Falls
+                    # back to encoder_attention_mask for older checkpoints.
+                    # Explicit ``is None`` check — ``a or b`` would call
+                    # ``bool(a)`` on the tensor and raise.
+                    ctc_mask = getattr(outputs, "ctc_attention_mask", None)
+                    if ctc_mask is None:
+                        ctc_mask = outputs.encoder_attention_mask
+                    input_lengths = ctc_mask.sum(-1).long() if ctc_mask is not None else None
                     batch_frames = int(input_lengths.sum().item()) if input_lengths is not None else ctc_logits.size(1) * ctc_logits.size(0)
 
                     if outputs.ctc_loss is not None and batch_frames > 0:
                         ctc_loss_sum += float(outputs.ctc_loss.detach().float().item()) * batch_frames
                         ctc_loss_frames += batch_frames
+
+                    if outputs.ctc_viable is not None:
+                        ctc_viable_count += int(outputs.ctc_viable.sum().item())
+                        ctc_viable_total += int(outputs.ctc_viable.numel())
 
                     pred_ids = ctc_greedy_decode(
                         ctc_logits.float(),
@@ -390,11 +404,16 @@ class CTCEvalCallback(TrainerCallback):
 
         wer = compute_wer(preds_all, refs_all)
         ctc_loss_mean = (ctc_loss_sum / ctc_loss_frames) if ctc_loss_frames > 0 else None
+        ctc_viable_pct = (
+            ctc_viable_count / float(ctc_viable_total) if ctc_viable_total > 0 else None
+        )
 
         if metrics is not None:
             metrics["eval/ctc_wer"] = float(wer)
             if ctc_loss_mean is not None:
                 metrics["eval/ctc_loss"] = float(ctc_loss_mean)
+            if ctc_viable_pct is not None:
+                metrics["eval/ctc_viable_pct"] = float(ctc_viable_pct)
 
         wandb = self._ensure_wandb()
         if wandb is not None:
@@ -405,109 +424,14 @@ class CTCEvalCallback(TrainerCallback):
             }
             if ctc_loss_mean is not None:
                 payload["eval/ctc_loss"] = float(ctc_loss_mean)
+            if ctc_viable_pct is not None:
+                payload["eval/ctc_viable_pct"] = float(ctc_viable_pct)
             wandb.log(payload, step=state.global_step)
         loss_str = f" ctc_loss={ctc_loss_mean:.4f}" if ctc_loss_mean is not None else ""
+        viable_str = (
+            f" ctc_viable_pct={ctc_viable_pct:.4f}" if ctc_viable_pct is not None else ""
+        )
         print(
             f"[ctc-eval] step={state.global_step} epoch={state.epoch} "
-            f"ctc_wer={wer:.4f}{loss_str}"
-        )
-
-
-class SWACallback(TrainerCallback):
-    """Stochastic Weight Averaging via ``torch.optim.swa_utils.AveragedModel``.
-
-    Maintains an equal-weight running mean of the model weights across the
-    final ``(1 - start_frac)`` fraction of training epochs, sampled once per
-    epoch at ``on_epoch_end``. At ``on_train_end`` the averaged weights are
-    written to ``<save_dir>/pytorch_model.bin`` (and a marker ``swa_info.json``)
-    so ``evaluate.py --checkpoint <save_dir>`` can pick them up directly.
-
-    Construction is deferred to the first epoch crossing ``start_frac`` so the
-    initial weights (which never enter the average) don't sit in GPU memory
-    during the first ~75% of training.
-    """
-
-    def __init__(self, start_frac: float, save_dir):
-        from pathlib import Path
-
-        self.start_frac = float(start_frac)
-        self.save_dir = Path(save_dir)
-        self.swa_model = None
-        self._updates = 0
-
-    @staticmethod
-    def _unwrap(model):
-        # DDP/compile wrappers expose the underlying module at ``.module``.
-        inner = model
-        while hasattr(inner, "module") and not isinstance(inner, type):
-            nxt = getattr(inner, "module")
-            if nxt is inner:
-                break
-            inner = nxt
-        return inner
-
-    def on_epoch_end(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        model=None,
-        **kwargs,
-    ) -> None:
-        import torch
-
-        if model is None or state.epoch is None or args.num_train_epochs <= 0:
-            return
-        progress = state.epoch / args.num_train_epochs
-        if progress < self.start_frac:
-            return
-
-        raw_model = self._unwrap(model)
-        if self.swa_model is None:
-            from torch.optim.swa_utils import AveragedModel
-
-            self.swa_model = AveragedModel(raw_model)
-            print(
-                f"[swa] starting weight averaging at epoch {state.epoch:.2f} / "
-                f"{args.num_train_epochs} (start_frac={self.start_frac})"
-            )
-        self.swa_model.update_parameters(raw_model)
-        self._updates += 1
-
-    def on_train_end(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ) -> None:
-        import json
-
-        import torch
-
-        # Save only on rank 0 to avoid DDP races. Under non-DDP, local_rank is -1.
-        if args.local_rank not in (-1, 0):
-            return
-        if self.swa_model is None or self._updates == 0:
-            print(
-                f"[swa] start_frac={self.start_frac} was never reached "
-                f"(epochs={args.num_train_epochs}); no SWA weights saved."
-            )
-            return
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        state_dict = self.swa_model.module.state_dict()
-        torch.save(state_dict, self.save_dir / "pytorch_model.bin")
-        with open(self.save_dir / "swa_info.json", "w") as f:
-            json.dump(
-                {
-                    "num_updates": self._updates,
-                    "start_frac": self.start_frac,
-                    "num_train_epochs": float(args.num_train_epochs),
-                },
-                f,
-                indent=2,
-            )
-        print(
-            f"[swa] wrote {self._updates}-epoch-averaged weights to "
-            f"{self.save_dir}/pytorch_model.bin"
+            f"ctc_wer={wer:.4f}{loss_str}{viable_str}"
         )

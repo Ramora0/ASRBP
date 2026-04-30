@@ -1,0 +1,142 @@
+model:
+  # Architecture selectors — see conformer_asr/{encoders,decoders}/__init__.py
+  # for the registered options.
+  encoder_type: conformer
+  decoder_type: bart
+  # Encoder matches Conformer-M (Gulati et al. 2020, Table 1): 16 layers, 256 dim,
+  # 4 heads, FFN expansion 4× → ~30M encoder params. Paper's conv kernel is 32;
+  # HF defaults to 31 — functionally equivalent.
+  encoder_hidden_size: 256
+  encoder_num_hidden_layers: 16
+  encoder_num_attention_heads: 4
+  encoder_intermediate_size: 1024
+  encoder_conv_depthwise_kernel_size: 31
+  # Dropouts lowered from the paper's 0.1 — pure-AED from scratch on a 20-epoch
+  # budget is underfit, not overfit; regularization here was suppressing fit.
+  encoder_hidden_dropout: 0.05
+  encoder_attention_dropout: 0.05
+  encoder_activation_dropout: 0.05
+  # Stochastic depth (uniform layer-drop during training). Conformer paper
+  # standard is ~0.1; doubles as regularization and breaks the epoch-9 peak-
+  # then-regress overfit seen on the prior run.
+  encoder_layerdrop: 0.1
+  # Log-Mel frontend. 80 bins, 25 ms window, 10 ms hop — 100 Hz frame rate,
+  # then the downsampler stem (see `downsampler` below) reduces to ~3.125 Hz.
+  n_mels: 80
+  n_fft: 400
+  hop_length: 160
+  # Spectrogram → transformer-input bridge. `conv2d` is the standard ASR
+  # stem: one Conv2d layer per `strides` entry, where each entry is
+  # [time_stride, mel_stride]. Kernel per axis is 3 when that axis's stride
+  # is > 1, else 1 (no spread). [2,2] downsamples both axes; [2,1] is
+  # time-only. See conformer_asr/downsamplers/ for registered options.
+  # 32× total time downsampling: two [2,2] mel+time stems then three [2,1]
+  # time-only layers (2×2×2×2×2 = 32).
+  downsampler:
+    type: conv2d
+    kwargs:
+      strides: [[2, 2], [2, 2], [2, 1], [2, 1], [2, 1]]
+  # AED decoder (not in the paper; they used RNN-T). Kept small and proportional
+  # to the encoder so total model lands around ~35M params.
+  decoder_d_model: 256
+  decoder_layers: 4
+  decoder_attention_heads: 4
+  decoder_ffn_dim: 1024
+  decoder_dropout: 0.05
+  decoder_max_position_embeddings: 448
+  # Hybrid CTC/AED. 0.3 CTC / 0.7 AED is the ESPnet/WeNet default and the
+  # sweet spot for from-scratch encoders — low enough that AED still dominates
+  # the decoder-side LM learning, high enough to force encoder alignment.
+  ctc_enabled: true
+  ctc_weight: 0.3
+  # Per-bin log-Mel normalization (running mean/var, frozen after N epochs).
+  # SB uses 4 — enough to stabilize stats on ~all960 without letting late-
+  # training batches drift them.
+  input_normalize_freeze_epochs: 4
+  # Pre-stem SpecAugment at 100 Hz. 4 time masks of 15-25 frames + 4 feature
+  # masks of 10-15 bins. Feature upper bound pulled back from 20 to 15 (Park
+  # et al. "LB" default) to keep expected mel coverage near ~55% rather than
+  # the ~68% 4×10-20 gave — still strong regularization without zeroing the
+  # majority of frequency content per sample. Zero-fill post-normalization
+  # (zero == per-bin mean). See conformer_asr/encoders/preproc.py.
+  spec_aug_time_masks: 4
+  spec_aug_time_length_low: 15
+  spec_aug_time_length_high: 25
+  spec_aug_feature_masks: 4
+  spec_aug_feature_length_low: 10
+  spec_aug_feature_length_high: 15
+  # Steps to train without SpecAugment before it turns on. Gives the encoder
+  # a clean signal during LR warmup to learn a crude alignment before the
+  # masking starts. ~1 epoch of all960 at eff batch 256 (≈1100 steps).
+  spec_aug_warmup_steps: 1000
+
+data:
+  dataset_id: openslr/librispeech_asr
+  subset: all960             # default: full 960h; override with --subset clean100 for smoke tests
+  eval_split: validation.clean
+  test_split: test.clean
+  sampling_rate: 16000
+  max_audio_seconds: 20.0
+  # Kaldi-style 3-way speed perturbation. [1.0] = off (no augmentation);
+  # [0.9, 1.0, 1.1] triples the train split with ±10% resampling. Only the
+  # train split is perturbed; eval/test stay at the original rate.
+  speed_perturbations: [0.9, 1.0, 1.1]
+  num_proc: 0         # 0 = autodetect (sched_getaffinity on Linux, os.cpu_count() elsewhere); thread pools are pinned to 1 in scripts/preprocess.py so they don't oversubscribe
+  # null → fetch SB's pretrained SentencePiece from HF Hub into cache_dir.
+  # Point at a local directory (e.g. a previous run's outputs/run/final) to
+  # reuse that run's saved sentencepiece.model; otherwise falls through to Hub.
+  tokenizer_dir: null
+  cache_dir: /fs/scratch/PAS2836/lees_stuff/hf_cache   # HF datasets + transformers cache
+
+train:
+  output_dir: outputs/run-c32x
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 8
+  # Effective batch held at 256 across hardware configs. With grad_accum=0
+  # below, scripts/train.py auto-derives grad_accum from WORLD_SIZE so the
+  # same YAML gives 256 effective batch on 1/2/4/8 GPUs (e.g. 4×V100×64 → 1,
+  # 1×A100×64 → 4). Set grad_accum to a positive integer to override.
+  effective_batch_size: 256
+  gradient_accumulation_steps: 0
+  learning_rate: 1.0e-3
+  # Fixed-step warmup (ESPnet / SpeechBrain / Gulati all use absolute steps,
+  # not a ratio). At eff batch 256 × ~1100 steps/epoch × 20 epochs ≈ 22k
+  # total steps, so 2500 ≈ 11% of training — the standard "small fraction"
+  # regime. SB's 25k warmup is a small fraction of their 200k+ run; copying
+  # the absolute number here made warmup ~45% of training, starving the
+  # model of sustained peak-LR updates.
+  warmup_steps: 2500
+  num_train_epochs: 30.0
+  weight_decay: 1.0e-4
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  label_smoothing_factor: 0.1
+  lr_scheduler_type: inverse_sqrt
+  logging_steps: 10
+  save_total_limit: 3
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  group_by_length: true
+  dataloader_num_workers: 8
+  dataloader_prefetch_factor: 4
+  report_to: wandb
+  seed: 42
+  generation_max_length: 300
+  generation_num_beams: 1
+
+wandb:
+  enabled: true
+  project: conformer-asr-librispeech
+  entity: null
+  run_name: conformer-c32x
+  group: null
+  tags: []
+  notes: ""
+  watch_model: false      # true to log gradients/weights (heavy)
+  log_preds_table: true   # log sample predictions table during eval
+  # 16 samples (halved from 32) to reduce the peak VRAM hit on rank 0 when the
+  # predictions-table callback runs its own generate() during eval on V100 32GB.
+  log_preds_n: 16

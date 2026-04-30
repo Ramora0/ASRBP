@@ -71,7 +71,15 @@ def _build_mel_conformer(mcfg: ModelConfig) -> MelConformerEncoder:
         dropout=mcfg.encoder_hidden_dropout,
     )
     spec_augment = _build_spec_augment(mcfg)
-    return MelConformerEncoder(enc_cfg, downsampler=downsampler, spec_augment=spec_augment)
+    return MelConformerEncoder(
+        enc_cfg,
+        downsampler=downsampler,
+        spec_augment=spec_augment,
+        cross_attn_layer_indices=mcfg.cross_attn_layer_indices,
+        cross_attn_num_heads=mcfg.cross_attn_num_heads,
+        cross_attn_dropout=mcfg.cross_attn_dropout,
+        cross_attn_kv_groups=mcfg.cross_attn_kv_groups,
+    )
 
 
 ENCODERS: dict[str, Callable[[ModelConfig], nn.Module]] = {

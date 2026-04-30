@@ -40,7 +40,12 @@ from transformers import (  # noqa: E402
 )
 from transformers.trainer_callback import ProgressCallback  # noqa: E402
 
-from conformer_asr.config import autocast_dtype, load_config, resolve_precision  # noqa: E402
+from conformer_asr.config import (  # noqa: E402
+    autocast_dtype,
+    load_config,
+    resolve_grad_accum,
+    resolve_precision,
+)
 from conformer_asr.data import (  # noqa: E402
     DataCollatorSpeechSeq2SeqWithPadding,
     RandomSpeedVariantSampler,
@@ -57,10 +62,106 @@ from conformer_asr.wandb_utils import (  # noqa: E402
     CTCEvalCallback,
     EpochLoggerCallback,
     PredictionsTableCallback,
-    SWACallback,
     init_wandb,
     wandb_is_enabled,
 )
+
+
+class StepTimerCallback(TrainerCallback):
+    """Per-step latency breakdown: total wall time vs. compute vs. data-wait.
+
+    On a healthy GPU-bound run, ``data_wait_ms`` percentiles should sit near 0
+    — workers stay ahead of the GPU. When the percentiles climb (especially
+    p95/p99) the dataloader is starving the GPU; common culprits are network
+    storage latency, too-small ``prefetch_factor``, or worker oversubscription.
+
+    Implementation: ``on_step_begin`` and ``on_step_end`` bracket the compute
+    portion of each micro-step. The gap between ``on_step_end`` of step N and
+    ``on_step_begin`` of step N+1 is data-wait + Python overhead. We log
+    p50 / p95 / p99 of each over the last ``logging_steps`` boundary, both
+    via ``tqdm.write`` and to ``wandb`` if the run is online.
+    """
+
+    def __init__(self) -> None:
+        import time
+
+        self._t = time.perf_counter
+        self._last_begin: float | None = None
+        self._last_end: float | None = None
+        self._compute_ms: list[float] = []
+        self._wait_ms: list[float] = []
+        self._total_ms: list[float] = []
+        # Mirror trainer's logging cadence; updated on first on_step_begin.
+        self._log_every: int = 50
+
+    @staticmethod
+    def _pct(xs: list[float], q: float) -> float:
+        if not xs:
+            return 0.0
+        s = sorted(xs)
+        idx = max(0, min(len(s) - 1, int(round(q * (len(s) - 1)))))
+        return s[idx]
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if state.is_world_process_zero:
+            now = self._t()
+            if self._last_end is not None:
+                self._wait_ms.append((now - self._last_end) * 1000.0)
+            if self._last_begin is not None:
+                self._total_ms.append((now - self._last_begin) * 1000.0)
+            self._last_begin = now
+            self._log_every = max(10, int(getattr(args, "logging_steps", 50) or 50))
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        now = self._t()
+        if self._last_begin is not None:
+            self._compute_ms.append((now - self._last_begin) * 1000.0)
+        self._last_end = now
+        if len(self._compute_ms) >= self._log_every:
+            p50_c = self._pct(self._compute_ms, 0.50)
+            p95_c = self._pct(self._compute_ms, 0.95)
+            p99_c = self._pct(self._compute_ms, 0.99)
+            p50_w = self._pct(self._wait_ms, 0.50)
+            p95_w = self._pct(self._wait_ms, 0.95)
+            p99_w = self._pct(self._wait_ms, 0.99)
+            p50_t = self._pct(self._total_ms, 0.50)
+            p95_t = self._pct(self._total_ms, 0.95)
+            line = (
+                f"[step-timer N={len(self._compute_ms)}] "
+                f"compute_ms p50={p50_c:.1f}/p95={p95_c:.1f}/p99={p99_c:.1f}  "
+                f"wait_ms p50={p50_w:.1f}/p95={p95_w:.1f}/p99={p99_w:.1f}  "
+                f"total_ms p50={p50_t:.1f}/p95={p95_t:.1f}"
+            )
+            try:
+                from tqdm.auto import tqdm
+
+                tqdm.write(line)
+            except Exception:
+                print(line)
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log(
+                        {
+                            "perf/compute_ms_p50": p50_c,
+                            "perf/compute_ms_p95": p95_c,
+                            "perf/compute_ms_p99": p99_c,
+                            "perf/wait_ms_p50": p50_w,
+                            "perf/wait_ms_p95": p95_w,
+                            "perf/wait_ms_p99": p99_w,
+                            "perf/total_ms_p50": p50_t,
+                            "perf/total_ms_p95": p95_t,
+                        },
+                        step=state.global_step,
+                    )
+            except Exception:
+                pass
+            self._compute_ms.clear()
+            self._wait_ms.clear()
+            self._total_ms.clear()
 
 
 class EmptyCacheCallback(TrainerCallback):
@@ -373,6 +474,21 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
     Also tracks per-step AED / CTC loss sums so they can be surfaced as
     ``train/aed_loss`` and ``train/ctc_loss`` on the next ``log()`` boundary,
     mirroring how HF's built-in ``tr_loss`` accumulator drives ``train/loss``.
+
+    When the encoder uses a boundary-predictor downsampler (or any downsampler
+    that exposes ``last_stats()``), the trainer also accumulates BP
+    diagnostics across the logging window and emits them under a ``bp/``
+    section (so they group into their own panel in wandb). Train-time keys:
+    ``bp/aux_loss``, ``bp/realized_prior``, ``bp/compression`` (post-
+    frontend), ``bp/total_compression`` (mel → post-BP). Static downsamplers
+    have no ``last_stats()`` so these keys simply don't appear.
+
+    The same accumulators run during evaluation (driven by ``prediction_step``
+    rather than ``compute_loss``); empirical compression at eval time is
+    surfaced under the same section as ``bp/eval_realized_prior`` /
+    ``bp/eval_compression`` / ``bp/eval_total_compression``. Eval-mode
+    forwards in ``BoundaryPredictorDownsampler`` skip the binomial loss, so
+    no ``bp/eval_aux_loss`` companion key is emitted.
     """
 
     def __init__(self, *args, **kwargs):
@@ -380,6 +496,35 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         self._aed_loss_sum = 0.0
         self._ctc_loss_sum = 0.0
         self._loss_component_count = 0
+        # CTC viability: # samples where ``input_len >= label_len + n_dup``,
+        # over the same logging window as ``aed/ctc_loss``. At low downsample
+        # rates this stays at 1.0; at high rates it drops as long-target /
+        # short-input clips fall under the CTC alignment floor.
+        self._ctc_viable_count = 0
+        self._ctc_viable_total = 0
+        self._bp_aux_loss_sum = 0.0
+        self._bp_n_boundaries = 0
+        self._bp_n_post_frontend = 0
+        self._bp_n_input = 0
+        self._bp_step_count = 0
+        # Eval-time BP accumulators. Reset on every ``evaluate()`` call so the
+        # numbers come out per-eval rather than rolling across the whole run.
+        self._eval_bp_n_boundaries = 0
+        self._eval_bp_n_post_frontend = 0
+        self._eval_bp_n_input = 0
+        # XA (cross-attn downsampler) per-layer residual-magnitude accumulators.
+        # Lazy-initialized on first stats hit since layer count is config-dependent.
+        # Reference accumulators track the conformer layer's own residual delta at
+        # the same depth — emitted as ``train/xa_relative_strength_l{i}`` so the
+        # per-tap signal is self-calibrated against an in-stack baseline.
+        self._xa_delta_rms_sum: list[float] = []
+        self._xa_q_rms_sum: list[float] = []
+        self._xa_ref_delta_rms_sum: list[float] = []
+        # Per-tap reference counter — independent of ``_xa_step_count`` because
+        # the conformer layer right before a tap can be layer-dropped
+        # (10% / layer / step), in which case its delta isn't recorded.
+        self._xa_ref_step_count: list[int] = []
+        self._xa_step_count = 0
 
     def compute_loss(
         self,
@@ -412,6 +557,20 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
         else:
             loss = aed_loss
 
+        # Re-fold the downsampler's auxiliary loss back into the total. The
+        # model's forward already added it to ``outputs.loss``, but we just
+        # rebuilt ``loss`` from ``aed_loss`` + ``ctc_loss`` (so the label
+        # smoother can run on AED logits), which dropped the aux term. Without
+        # this re-add, the BP's binomial gradient never enters backward and
+        # the BP MLP receives ``.grad = None`` — silently making the aux loss
+        # a no-op for any downsampler that exposes ``aux_loss()``.
+        encoder_for_aux = getattr(unwrapped, "encoder", None)
+        ds_for_aux = getattr(encoder_for_aux, "downsampler", None) if encoder_for_aux is not None else None
+        aux_fn = getattr(ds_for_aux, "aux_loss", None) if ds_for_aux is not None else None
+        aux_loss = aux_fn() if aux_fn is not None else None
+        if aux_loss is not None and loss is not None:
+            loss = loss + aux_loss.to(loss.dtype)
+
         # Accumulate component sums for the next ``log()`` emission. Detaching
         # first so we don't retain autograd graphs across steps.
         if aed_loss is not None:
@@ -420,7 +579,86 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
             self._ctc_loss_sum += float(ctc_loss.detach().float().item())
         self._loss_component_count += 1
 
+        # CTC viability rollup. ``ctc_viable`` is a (B,) bool tensor stamped
+        # by ``ConformerAEDWithCTC._compute_ctc_loss``; sum / total gives the
+        # fraction of samples in this window where CTC's input-length floor
+        # is met. Skipped silently for AED-only models (no CTC head).
+        ctc_viable = getattr(outputs, "ctc_viable", None)
+        if ctc_viable is not None:
+            self._ctc_viable_count += int(ctc_viable.sum().item())
+            self._ctc_viable_total += int(ctc_viable.numel())
+
+        # Auxiliary stats. The downsampler exposes ``last_stats()`` for BP-
+        # style boundary metrics; the encoder exposes it for the per-tap
+        # cross-attn delta RMS used to track interleaved-XA learning. Each
+        # owns its own key namespace, so we just merge whatever's there and
+        # branch on key presence below.
+        encoder = getattr(unwrapped, "encoder", None)
+        for obj in (getattr(encoder, "downsampler", None), encoder):
+            stats_fn = getattr(obj, "last_stats", None) if obj is not None else None
+            stats = stats_fn() if stats_fn is not None else None
+            if stats is None:
+                continue
+            if "n_boundaries" in stats:
+                if stats.get("aux_loss") is not None:
+                    self._bp_aux_loss_sum += stats["aux_loss"]
+                self._bp_n_boundaries += stats["n_boundaries"]
+                self._bp_n_post_frontend += stats["n_post_frontend"]
+                self._bp_n_input += stats["n_input"]
+                self._bp_step_count += 1
+            if "xa_delta_rms" in stats:
+                deltas = stats["xa_delta_rms"]
+                q_rms = stats["xa_q_rms"]
+                ref_d = stats.get("xa_ref_layer_delta_rms") or [None] * len(deltas)
+                if not self._xa_delta_rms_sum:
+                    self._xa_delta_rms_sum = [0.0] * len(deltas)
+                    self._xa_q_rms_sum = [0.0] * len(deltas)
+                    self._xa_ref_delta_rms_sum = [0.0] * len(deltas)
+                    self._xa_ref_step_count = [0] * len(deltas)
+                for i, (d, q, rd) in enumerate(zip(deltas, q_rms, ref_d)):
+                    self._xa_delta_rms_sum[i] += float(d)
+                    self._xa_q_rms_sum[i] += float(q)
+                    if rd is not None:
+                        self._xa_ref_delta_rms_sum[i] += float(rd)
+                        self._xa_ref_step_count[i] += 1
+                self._xa_step_count += 1
+
         return (loss, outputs) if return_outputs else loss
+
+    def _accumulate_eval_bp_stats(self, model) -> None:
+        """Read ``last_stats()`` off the model's downsampler and add to the
+        eval-time accumulators. No-op for downsamplers without ``last_stats``.
+        """
+        unwrapped = model
+        while hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+        downsampler = getattr(getattr(unwrapped, "encoder", None), "downsampler", None)
+        last_stats_fn = getattr(downsampler, "last_stats", None) if downsampler is not None else None
+        if last_stats_fn is None:
+            return
+        stats = last_stats_fn()
+        if stats is None:
+            return
+        self._eval_bp_n_boundaries += stats["n_boundaries"]
+        self._eval_bp_n_post_frontend += stats["n_post_frontend"]
+        self._eval_bp_n_input += stats["n_input"]
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # Eval driver: ``Seq2SeqTrainer.prediction_step`` runs the encoder via
+        # ``generate()`` first (then any prediction-loss forward). We tap the
+        # downsampler cache after super returns — by that point the most-recent
+        # encoder forward has populated ``last_stats()`` for this batch.
+        result = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+        self._accumulate_eval_bp_stats(model)
+        return result
+
+    def evaluate(self, *args, **kwargs):
+        # Reset eval accumulators at the *start* of every evaluate() call so the
+        # numbers reflect this eval pass and don't bleed across epoch boundaries.
+        self._eval_bp_n_boundaries = 0
+        self._eval_bp_n_post_frontend = 0
+        self._eval_bp_n_input = 0
+        return super().evaluate(*args, **kwargs)
 
     def log(self, logs, *args, **kwargs):
         # HF fires ``log()`` for both training (``loss`` key) and eval
@@ -430,15 +668,80 @@ class HybridSeq2SeqTrainer(SpeedAugSeq2SeqTrainer):
             denom = float(self._loss_component_count)
             logs["train/aed_loss"] = self._aed_loss_sum / denom
             logs["train/ctc_loss"] = self._ctc_loss_sum / denom
+            if self._ctc_viable_total > 0:
+                logs["train/ctc_viable_pct"] = (
+                    self._ctc_viable_count / float(self._ctc_viable_total)
+                )
             self._aed_loss_sum = 0.0
             self._ctc_loss_sum = 0.0
             self._loss_component_count = 0
+            self._ctc_viable_count = 0
+            self._ctc_viable_total = 0
+            if self._bp_step_count > 0:
+                logs["bp/aux_loss"] = self._bp_aux_loss_sum / float(self._bp_step_count)
+                if self._bp_n_post_frontend > 0:
+                    logs["bp/realized_prior"] = (
+                        self._bp_n_boundaries / float(self._bp_n_post_frontend)
+                    )
+                    logs["bp/compression"] = (
+                        self._bp_n_post_frontend / max(1, self._bp_n_boundaries)
+                    )
+                if self._bp_n_input > 0:
+                    logs["bp/total_compression"] = (
+                        self._bp_n_input / max(1, self._bp_n_boundaries)
+                    )
+                self._bp_aux_loss_sum = 0.0
+                self._bp_n_boundaries = 0
+                self._bp_n_post_frontend = 0
+                self._bp_n_input = 0
+                self._bp_step_count = 0
+            if self._xa_step_count > 0:
+                denom_xa = float(self._xa_step_count)
+                for i in range(len(self._xa_delta_rms_sum)):
+                    d_mean = self._xa_delta_rms_sum[i] / denom_xa
+                    q_mean = self._xa_q_rms_sum[i] / denom_xa
+                    if q_mean > 0:
+                        # Absolute ratio: XA's contribution to the residual
+                        # stream entering the block.
+                        logs[f"train/xa_delta_ratio_l{i}"] = d_mean / q_mean
+                    # Relative strength: XA's contribution as a fraction of
+                    # the conformer layer's own residual delta at the same
+                    # depth. Self-calibrating — > 0.25 means XA is doing real
+                    # work relative to a full conformer layer; < 0.05 means
+                    # XA is small change vs the layer's own contribution.
+                    n_ref = self._xa_ref_step_count[i]
+                    if n_ref > 0:
+                        rd_mean = self._xa_ref_delta_rms_sum[i] / float(n_ref)
+                        if rd_mean > 0:
+                            logs[f"train/xa_relative_strength_l{i}"] = d_mean / rd_mean
+                self._xa_delta_rms_sum = [0.0] * len(self._xa_delta_rms_sum)
+                self._xa_q_rms_sum = [0.0] * len(self._xa_q_rms_sum)
+                self._xa_ref_delta_rms_sum = [0.0] * len(self._xa_ref_delta_rms_sum)
+                self._xa_ref_step_count = [0] * len(self._xa_ref_step_count)
+                self._xa_step_count = 0
+        # Eval log boundary — emit empirical compression rate over the eval set.
+        # The downsampler's eval-mode forward zeros out the binomial loss, so
+        # there's no ``bp/eval_aux_loss`` companion key — only the realized
+        # rate / compression are meaningful at eval time. Eval keys live in
+        # the same ``bp/`` section as train-time keys, prefixed with ``eval_``
+        # so a single panel shows train vs eval side-by-side.
+        if "eval_loss" in logs and self._eval_bp_n_post_frontend > 0:
+            logs["bp/eval_realized_prior"] = (
+                self._eval_bp_n_boundaries / float(self._eval_bp_n_post_frontend)
+            )
+            logs["bp/eval_compression"] = (
+                self._eval_bp_n_post_frontend / max(1, self._eval_bp_n_boundaries)
+            )
+            if self._eval_bp_n_input > 0:
+                logs["bp/eval_total_compression"] = (
+                    self._eval_bp_n_input / max(1, self._eval_bp_n_boundaries)
+                )
         return super().log(logs, *args, **kwargs)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config", default="configs/conformer_small.yaml")
+    p.add_argument("--config", default="configs/cnns/c4x.yaml")
     p.add_argument("--subset", choices=["clean100", "clean460", "all960"])
     p.add_argument("--output_dir")
     p.add_argument("--num_train_epochs", type=float)
@@ -507,6 +810,23 @@ def main() -> None:
     # V100 / Volta doesn't support bf16 — fall back to fp16 automatically.
     resolve_precision(cfg.train)
 
+    # Derive gradient_accumulation_steps from effective_batch_size and the
+    # runtime WORLD_SIZE if it wasn't pinned in the YAML / on the CLI. Keeps
+    # effective batch constant across 1 / 2 / 4 / 8-GPU runs.
+    resolve_grad_accum(cfg.train, _world_size())
+    if _is_main_process():
+        print(
+            f"[batch] effective_batch_size={cfg.train.effective_batch_size}  "
+            f"per_device={cfg.train.per_device_train_batch_size}  "
+            f"world_size={_world_size()}  "
+            f"gradient_accumulation_steps={cfg.train.gradient_accumulation_steps}"
+        )
+        print(
+            f"[dataloader] num_workers={cfg.train.dataloader_num_workers}  "
+            f"prefetch_factor={cfg.train.dataloader_prefetch_factor}  "
+            f"cache_dir={cfg.data.cache_dir}"
+        )
+
     # Let fp16/bf16 matmuls use reduced-precision intermediate accumulation.
     # ~1-2% throughput win on V100 fp16, imperceptible numerical impact for ASR.
     import torch
@@ -531,11 +851,33 @@ def main() -> None:
                 "process before launching multi-GPU training."
             )
 
-    print("Loading LibriSpeech …")
-    ds = load_librispeech(cfg.data)
+    # Short-circuit when the preprocessed cache already exists: load it
+    # directly and skip ``load_librispeech``, which otherwise calls
+    # ``datasets.load_dataset`` for each split and re-downloads the raw
+    # 1.2 TB audio archive whenever the HF datasets cache is empty (e.g.
+    # on a fresh per-node /tmp). The preprocessed shards are the only thing
+    # the trainer actually consumes downstream.
+    pre_key = _preprocess_cache_key(cfg.model, tokenizer, cfg.data)
+    pre_dir = _preprocess_cache_dir(cfg.data, pre_key)
+    if pre_dir is not None and pre_dir.exists():
+        from datasets import load_from_disk
 
-    print("Preprocessing dataset (this caches to disk after first run)")
-    ds = preprocess_dataset(ds, cfg.model, tokenizer, cfg.data)
+        print(f"[preprocess] loading cached dataset from {pre_dir} (raw download skipped)")
+        ds = load_from_disk(str(pre_dir))
+    else:
+        print("Loading LibriSpeech …")
+        ds = load_librispeech(cfg.data)
+        print("Preprocessing dataset (this caches to disk after first run)")
+        ds = preprocess_dataset(ds, cfg.model, tokenizer, cfg.data)
+
+    # Stored Arrow type is ``list<list<float>>``; default __getitem__ would
+    # box every leaf float into a CPython PyFloat (~130K allocs / row), then
+    # ``torch.as_tensor`` walks the nested list to copy it back out — pure
+    # CPython object churn that dominates the dataloader CPU budget. The
+    # numpy formatter calls PyArrow's C++ kernel to emit a flat float32 array
+    # directly, so the collator's ``torch.as_tensor`` becomes a near-zero-copy
+    # ndarray view. Net: ~5-6× faster per row, GPU stays fed.
+    ds = ds.with_format("numpy")
 
     model = build_model(cfg.model, tokenizer)
     n_params = sum(p.numel() for p in model.parameters())
@@ -601,6 +943,7 @@ def main() -> None:
         greater_is_better=False,
         dataloader_num_workers=cfg.train.dataloader_num_workers,
         dataloader_persistent_workers=True,
+        dataloader_prefetch_factor=cfg.train.dataloader_prefetch_factor,
         remove_unused_columns=False,
         group_by_length=cfg.train.group_by_length,
         length_column_name="input_length",
@@ -654,6 +997,7 @@ def main() -> None:
             f"({args.early_eval_frac:.1%} of epoch 1, ~{steps_per_epoch} steps/epoch)"
         )
         callbacks.append(OneShotEvalCallback(target_step=target_step))
+    callbacks.append(StepTimerCallback())
     callbacks.append(EmptyCacheCallback())
     # Must run AFTER EmptyCacheCallback has done its work but order here doesn't
     # matter; on_save only needs the saved directory to exist on disk.
@@ -661,14 +1005,6 @@ def main() -> None:
     callbacks.append(FreezeInputNormCallback(cfg.model.input_normalize_freeze_epochs))
     if cfg.model.spec_aug_warmup_steps > 0:
         callbacks.append(SpecAugWarmupCallback(cfg.model.spec_aug_warmup_steps))
-    if cfg.train.swa_enabled:
-        callbacks.append(
-            SWACallback(
-                start_frac=cfg.train.swa_start_frac,
-                save_dir=Path(cfg.train.output_dir) / "final-swa",
-            )
-        )
-
     # Distinct speeds in the cache — if >1, the train split has that many
     # variant rows per clip (laid out contiguously) and the Trainer will
     # subsample to one per clip per epoch via RandomSpeedVariantSampler.

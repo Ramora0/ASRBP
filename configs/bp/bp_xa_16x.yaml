@@ -46,13 +46,19 @@ model:
   # comparison isolates "BP-predicted picking" as the only architectural
   # difference. Encoder's _encoder_with_xa reads downsampler._kept_indices
   # for Q's per-sample RoPE positions; falls back to stride-based positions
-  # when the downsampler doesn't provide them (e.g. cross_attn). K/V is
-  # shared across taps via SharedKVProjector, so one tap per conformer
-  # layer is roughly the cost of 4 sparse taps under the old per-block
-  # K/V scheme.
+  # when the downsampler doesn't provide them (e.g. cross_attn).
+  #
+  # cross_attn_kv_groups=4 ⇒ 16 XA blocks split into 4 contiguous depth
+  # groups of 4, each with its own SharedKVProjector. Reintroduces some of
+  # the K/V capacity that the fully-shared (kv_groups=1) variant lost (it
+  # was unstable past ~5 epochs and worse before that), without going all
+  # the way back to per-layer K/V. Runtime cost: 4 K/V projections per
+  # encoder forward at T_k instead of 1, still much cheaper than the
+  # 16 of standard per-layer XA.
   cross_attn_layer_indices: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
   cross_attn_num_heads: 4
   cross_attn_dropout: 0.0
+  cross_attn_kv_groups: 4
   decoder_d_model: 256
   decoder_layers: 4
   decoder_attention_heads: 4
@@ -110,8 +116,6 @@ train:
   seed: 42
   generation_max_length: 300
   generation_num_beams: 1
-  swa_enabled: true
-  swa_start_frac: 0.75
 
 wandb:
   enabled: true

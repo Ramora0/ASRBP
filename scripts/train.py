@@ -62,7 +62,6 @@ from conformer_asr.wandb_utils import (  # noqa: E402
     CTCEvalCallback,
     EpochLoggerCallback,
     PredictionsTableCallback,
-    SWACallback,
     init_wandb,
     wandb_is_enabled,
 )
@@ -1006,14 +1005,6 @@ def main() -> None:
     callbacks.append(FreezeInputNormCallback(cfg.model.input_normalize_freeze_epochs))
     if cfg.model.spec_aug_warmup_steps > 0:
         callbacks.append(SpecAugWarmupCallback(cfg.model.spec_aug_warmup_steps))
-    if cfg.train.swa_enabled:
-        callbacks.append(
-            SWACallback(
-                start_frac=cfg.train.swa_start_frac,
-                save_dir=Path(cfg.train.output_dir) / "final-swa",
-            )
-        )
-
     # Distinct speeds in the cache — if >1, the train split has that many
     # variant rows per clip (laid out contiguously) and the Trainer will
     # subsample to one per clip per epoch via RandomSpeedVariantSampler.
@@ -1053,24 +1044,6 @@ def main() -> None:
     is_main = trainer.is_world_process_zero()
     if is_main:
         tokenizer.save_pretrained(str(final_dir))
-
-        # If SWA ran, make ``final-swa/`` a drop-in checkpoint dir by copying
-        # over the config + tokenizer metadata ``trainer.save_model`` wrote to
-        # ``final/``. Only the weights themselves differ between the two dirs.
-        swa_dir = Path(cfg.train.output_dir) / "final-swa"
-        if cfg.train.swa_enabled and (swa_dir / "model.safetensors").exists():
-            import shutil
-
-            for name in (
-                "config.json",
-                "generation_config.json",
-                "training_args.bin",
-                "sentencepiece.model",
-                "tokenizer_info.json",
-            ):
-                src = final_dir / name
-                if src.exists():
-                    shutil.copy2(src, swa_dir / name)
 
     # Post-training evaluation. evaluate.py είναι intentionally wandb-free and
     # single-process; we shell out from rank 0, strip torchrun's distributed env

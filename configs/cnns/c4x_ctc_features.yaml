@@ -129,11 +129,6 @@ train:
   seed: 42
   generation_max_length: 300
   generation_num_beams: 1
-  # Stochastic Weight Averaging: maintain a per-epoch running mean of weights
-  # from 75% of the schedule onward, save to <output_dir>/final-swa/ at
-  # train end. Evaluate separately via evaluate.py --checkpoint <dir>.
-  swa_enabled: true
-  swa_start_frac: 0.75
 
 wandb:
   enabled: true

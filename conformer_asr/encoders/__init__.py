@@ -78,6 +78,7 @@ def _build_mel_conformer(mcfg: ModelConfig) -> MelConformerEncoder:
         cross_attn_layer_indices=mcfg.cross_attn_layer_indices,
         cross_attn_num_heads=mcfg.cross_attn_num_heads,
         cross_attn_dropout=mcfg.cross_attn_dropout,
+        cross_attn_kv_groups=mcfg.cross_attn_kv_groups,
     )
 
 

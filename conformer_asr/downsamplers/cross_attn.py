@@ -67,20 +67,26 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 class SharedKVProjector(nn.Module):
-    """Encoder-level shared K/V projector for the interleaved cross-attn taps.
+    """Encoder-level K/V projector shared across a group of cross-attn taps.
 
-    Every ``CrossAttnBlock`` inserted into ``MelConformerEncoder`` consumes
-    the same K/V source (``downsampler._post_cnn_features``) at the same K
-    positions (``arange(T_k)``), so applying ``LayerNorm + Linear(K) +
-    Linear(V) + RoPE(K)`` per block was repeated work. Hoisting these into
-    one module called once per encoder forward drops the per-tap marginal
+    Every ``CrossAttnBlock`` in a given group consumes the same K/V source
+    (``downsampler._post_cnn_features``) at the same K positions
+    (``arange(T_k)``), so applying ``LayerNorm + Linear(K) + Linear(V) +
+    RoPE(K)`` per block was repeated work. Hoisting these into one module
+    called once per encoder forward (per group) drops the per-tap marginal
     cost ~5×: K/V projections at the high rate ``T_k`` are the single
     biggest line item in a block, and at typical T_k = 4 × T_q they account
     for ~80% of one block's compute.
 
+    The encoder owns a list of these projectors (``kv_projectors``); the
+    contiguous depth-wise partition in ``block_to_group`` decides which
+    projector each block reads from. ``n_groups == 1`` recovers the original
+    "every tap shares one global K/V" design; ``n_groups == n_taps``
+    recovers standard per-layer cross-attention.
+
     Per-block freedom on the *query* side (own ``norm_q``, ``q_proj``,
-    ``out_proj``) is preserved — different taps can still attend to
-    different "views" of the shared K/V via their own query function.
+    ``out_proj``) is always preserved — taps within a group still attend
+    to different "views" of the shared K/V via their own query function.
 
     Shape contract: ``forward(kv, k_positions)`` returns ``(K, V)`` of shape
     ``(B, num_heads, T_k, head_dim)`` with K already RoPE-rotated, ready to
